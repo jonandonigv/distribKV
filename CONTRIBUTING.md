@@ -114,6 +114,7 @@ Follow [Conventional Commits](https://www.conventionalcommits.org/) format:
 - `perf`: Performance improvements
 - `test`: Adding or updating tests
 - `chore`: Build process, tooling, dependencies
+- `wip`: Work in progress, some work in progress feature that hasn't been finished yet
 
 ### Examples
 
@@ -149,6 +150,7 @@ including cases with network partitions and delays.
 ### Before Opening PR
 
 1. **Update develop**: Ensure your branch is up to date
+
    ```bash
    git checkout develop
    git pull origin develop
@@ -157,12 +159,14 @@ including cases with network partitions and delays.
    ```
 
 2. **Run tests**: All tests must pass
+
    ```bash
    go test -race ./...
    go test -race -cover ./...
    ```
 
 3. **Format code**: Ensure code is properly formatted
+
    ```bash
    gofmt -w .
    ```
@@ -175,6 +179,7 @@ including cases with network partitions and delays.
 ### PR Title Format
 
 Use conventional commit format:
+
 - `feat: add log compaction`
 - `fix: resolve election deadlock`
 - `docs: update Raft implementation notes`
@@ -183,23 +188,28 @@ Use conventional commit format:
 
 ```markdown
 ## Summary
+
 Brief description of changes (2-3 sentences)
 
 ## Changes
+
 - Bullet list of main changes
 - Highlight any breaking changes
 - Note any new dependencies
 
 ## Testing
+
 - Tests added/modified
 - Manual testing performed
 - Test results: `go test -race ./...`
 
 ## Related Issues
+
 Closes #123
 Refs #456
 
 ## Checklist
+
 - [ ] Code follows style guidelines
 - [ ] All tests pass with `-race` flag
 - [ ] Comments added where needed
@@ -263,6 +273,7 @@ go test -race -cover ./...
 ### Versioning
 
 We use [Semantic Versioning](https://semver.org/):
+
 - MAJOR: Incompatible API changes
 - MINOR: Backwards-compatible functionality
 - PATCH: Backwards-compatible bug fixes
