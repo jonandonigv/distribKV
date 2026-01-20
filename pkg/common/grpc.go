@@ -86,6 +86,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		return nil
 	}
 
+	// TODO: Replace the grpc.DialContext with NewClient
 	var err error
 	c.conn, err = grpc.DialContext(
 		ctx,
