@@ -79,6 +79,12 @@ func NewClient(target string) *Client {
 }
 
 func (c *Client) Connect(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
