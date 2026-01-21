@@ -141,7 +141,7 @@ func GetLocalAddr() string {
 func WithRetry(ctx context.Context, maxRetries int, delay time.Duration, fn func() error) error {
 	var lastErr error
 
-	for i := 0; i < maxRetries; i++ {
+	for range maxRetries {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
