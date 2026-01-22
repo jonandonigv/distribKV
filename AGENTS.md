@@ -11,6 +11,13 @@ Distributed Key-Value Store using Raft consensus algorithm in Go. This is a lear
 ```bash
 go mod tidy
 go build -o bin/kvserver ./cmd/raft-kv-server
+
+# gRPC Health CLI Tools
+go build -o bin/grpc-test-server ./cmd/grpc-test-server
+go build -o bin/grpc-test-client ./cmd/grpc-test-client
+go build -o bin/ ./cmd/...
+
+# Testing
 go test ./...
 go test -race ./...
 go test ./pkg/raft -run TestElection -v
