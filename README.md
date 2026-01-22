@@ -60,7 +60,15 @@ go mod tidy
 ### Build
 
 ```bash
-go build -o bin/kvserver ./cmd/raft-kv-server
+# Using make (recommended)
+make build
+
+# Or build individual components
+make server  # Build grpc-test-server
+make client  # Build grpc-test-client
+
+# Build all binaries
+go build -o bin/ ./cmd/...
 ```
 
 ### Running Tests
@@ -85,15 +93,96 @@ go test -race -cover ./...
 ./bin/kvserver -id 3 -peers localhost:10001,localhost:10002,localhost:10003 &
 ```
 
+## Testing gRPC Infrastructure
+
+The project includes CLI tools to test the gRPC communication layer using a standard Health Check service.
+
+### Start Server
+
+```bash
+# Start on default port (50051)
+./bin/grpc-test-server
+
+# Start on custom port with custom ID
+./bin/grpc-test-server --port=10001 --id=server-1
+```
+
+Server options:
+- `--port` - Server port (default: 50051)
+- `--id` - Server identifier for logging (default: "1")
+
+### Run Client
+
+**Single Request Mode (default):**
+
+```bash
+./bin/grpc-test-client --addr=localhost:50051 --id=client-1
+```
+
+Single mode performs one health check and exits with status 0 on success, 1 on failure.
+
+**Continuous Request Mode:**
+
+```bash
+# Send 10 requests with 500ms delay between requests
+./bin/grpc-test-client --addr=localhost:50051 --mode=continuous --requests=10 --delay=500ms --id=load-test-1
+```
+
+Continuous mode options:
+- `--mode` - "single" or "continuous" (default: single)
+- `--requests` - Number of requests to send (continuous mode, default: 1)
+- `--delay` - Delay between requests (continuous mode, default: 1s)
+- `--addr` - Server address (default: localhost:50051)
+- `--id` - Client identifier for logging (default: "client")
+
+### Multi-Client Testing
+
+Test concurrent client connections:
+
+```bash
+# Terminal 1: Start server
+./bin/grpc-test-server --port=50051 --id=server
+
+# Terminal 2: Start client 1
+./bin/grpc-test-client --id=client-1 --mode=continuous --requests=100 --delay=200ms &
+
+# Terminal 3: Start client 2
+./bin/grpc-test-client --id=client-2 --mode=continuous --requests=100 --delay=300ms &
+
+# Terminal 4: Start client 3
+./bin/grpc-test-client --id=client-3 --mode=continuous --requests=100 --delay=400ms &
+```
+
+Each client logs its own statistics including success rate and average latency.
+
+### Graceful Shutdown
+
+Both server and client respond to `SIGINT` (Ctrl+C) and `SIGTERM` signals gracefully.
+
+```bash
+# Server logs shutdown sequence
+[test-server] 2026/01/22 12:32:49 Health check server listening on port 50051
+^C[test-server] 2026/01/22 12:32:52 Shutting down server...
+[test-server] 2026/01/22 12:32:52 Server stopped gracefully
+```
+
+Client in continuous mode reports statistics before shutting down.
+
 ## Project Structure
 
 ```
 distribKV/
 ├── cmd/
-│   └── raft-kv-server/    # Main server binary
+│   ├── grpc-test-server/   # gRPC Health Check server (testing)
+│   │   └── main.go
+│   ├── grpc-test-client/   # gRPC Health Check client (testing)
+│   │   └── main.go
+│   └── raft-kv-server/    # Main KV server (future)
 ├── pkg/
 │   ├── common/
-│   │   └── grpc.go        # gRPC utilities
+│   │   └── grpc.go        # gRPC server/client utilities
+│   ├── health/
+│   │   └── health.go      # Health Check service implementation
 │   ├── raft/
 │   │   ├── raft.go        # Main Raft implementation
 │   │   ├── election.go    # Leader election logic
@@ -102,6 +191,14 @@ distribKV/
 │   └── kvserver/
 │       ├── server.go      # KV service on Raft
 │       └── clerk.go       # Client library
+├── proto/
+│   ├── health.proto       # Health Check service definition
+│   ├── health.pb.go      # Generated messages
+│   └── health_grpc.pb.go # Generated service interfaces
+├── bin/
+│   ├── grpc-test-server   # Compiled server binary
+│   └── grpc-test-client   # Compiled client binary
+├── Makefile               # Build convenience targets
 ├── configs/
 │   └── cluster.yaml       # Cluster configuration
 └── scripts/
@@ -149,6 +246,12 @@ clerk.Append("foo", "-baz") // foo becomes "bar-baz"
 ## Contributing
 
 This is a learning project. Follow the guidelines in [AGENTS.md](./AGENTS.md) for code style and testing.
+
+When making changes to gRPC infrastructure:
+1. Test with `grpc-test-server` and `grpc-test-client` CLI tools
+2. Verify multi-client scenarios work correctly
+3. Ensure graceful shutdown on signals
+4. Run tests with race detector: `go test -race ./...`
 
 ## License
 
