@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package raftpc
+
+option go_package = "github.com/jonandonigv/distrivKV/proto/raftpc";
+
+service Raftpc {
+  rpc RequestVote(VoteReq) returns (VoteResponse);
+  rpc AppendEntries(AppendReq) returns (AppendResponse);
+}
+
+message VoteReq {}
+
+message AppendReq {}
