@@ -7,9 +7,9 @@ import (
 )
 
 type Raft struct {
-	mu    sync.Mutex
-	peers []*grpc.ClientConn // Subject to change
-	me    int
+	mu       sync.Mutex
+	peers    []*grpc.ClientConn // Subject to change
+	serverId int
 
 	// Persistent state
 	currentTerm int
