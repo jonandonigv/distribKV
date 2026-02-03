@@ -1,6 +1,6 @@
 # distribKV
 
-A distributed key-value store built with the Raft consensus algorithm in Go. This is a learning-focused implementation following the MIT 6.824 Distributed Systems course.
+A distributed key-value store built with the Raft consensus algorithm in Go. While initially developed as a learning project following the MIT 6.824 Distributed Systems course, this implementation is architected with production use in mind and will be hardened for production deployment.
 
 ## Overview
 
@@ -245,7 +245,7 @@ clerk.Append("foo", "-baz") // foo becomes "bar-baz"
 
 ## Contributing
 
-This is a learning project. Follow the guidelines in [AGENTS.md](./AGENTS.md) for code style and testing.
+This project is being developed with production deployment as a goal. Follow the guidelines in [AGENTS.md](./AGENTS.md) for code style and testing.
 
 When making changes to gRPC infrastructure:
 1. Test with `grpc-test-server` and `grpc-test-client` CLI tools
