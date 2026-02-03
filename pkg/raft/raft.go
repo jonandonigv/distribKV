@@ -17,7 +17,7 @@ type Raft struct {
 	log         []LogEntry
 
 	// Volatile state
-	state       State
+	state       State // Follower, Candidate, Leader
 	commitIndex int
 	lastApplied int
 
