@@ -25,3 +25,17 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 }
+
+type State int
+
+const (
+	Follower State = iota
+	Cadidate
+	Leader
+)
+
+type LogEntry struct {
+	index   int64
+	term    int
+	command []byte
+}
