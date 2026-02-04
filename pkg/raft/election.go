@@ -26,16 +26,21 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		r.votedFor = -1
 		r.state = Follower
 		reply.Term = req.Term
+		// TODO: Reset election timer - we've heard from a valid leader/candidate
 	}
+
+	// TODO: Persist currentTerm and votedFor to stable storage before responding
+	// (Raft requirement: persist state before responding to RPCs)
 
 	// Check if we can vote for this candidate
 	// Vote if: haven't voted yet, or already voted for this candidate
 	if r.votedFor == -1 || r.votedFor == int(req.CandidateId) {
 		// Check if candidate's log is at least as up-to-date as ours
-		lastLogIndex := len(r.log) - 1
+		// Note: Raft uses 1-based indexing (0 means empty log)
+		lastLogIndex := len(r.log) // 0 if empty, otherwise index of last entry
 		lastLogTerm := 0
-		if lastLogIndex >= 0 {
-			lastLogTerm = r.log[lastLogIndex].term
+		if lastLogIndex > 0 {
+			lastLogTerm = r.log[lastLogIndex-1].term // Array is 0-based
 		}
 
 		// Candidate's log is at least as up-to-date if:
