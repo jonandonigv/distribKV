@@ -110,3 +110,20 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 // - Become Follower
 // - Reset election timer
 // - Called when higher term discovered
+
+// becomeLeader transitions the node to leader state.
+// Called when candidate receives majority of votes.
+func (r *Raft) becomeLeader() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.state = Leader
+
+	for _, peer := range r.peers {
+		peer.nextIndex = len(r.log) + 1
+		peer.matchIndex = 0
+	}
+
+	// TODO: Start heartbeat sender goroutine
+	// TODO: Stop election timer
+}
