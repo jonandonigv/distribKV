@@ -1,5 +1,15 @@
 package main
 
+// TODO: This is a test tool - NOT the production KV client
+//
+// Purpose: Test gRPC infrastructure using Health Check service
+//
+// Production Client Needed:
+// - Use pkg/kvserver/clerk.go for actual KV operations
+// - Connect to Raft cluster via KV service
+// - Handle leader discovery and redirects
+// - Implement retry logic for failures
+
 import (
 	"context"
 	"flag"

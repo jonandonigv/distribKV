@@ -1,5 +1,17 @@
 package main
 
+// TODO: This is a test tool - NOT the production KV server
+//
+// Purpose: Test gRPC infrastructure using Health Check service
+//
+// Production Server Needed:
+// - cmd/raft-kv-server/main.go should be created
+// - Initialize Raft with peer list
+// - Register Raft service for RPC handling
+// - Register KV service for client requests
+// - Start election timer
+// - Handle graceful shutdown with state persistence
+
 import (
 	"flag"
 	"fmt"
