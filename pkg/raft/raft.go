@@ -51,8 +51,8 @@ const (
 
 type LogEntry struct {
 	Index   int64
-	term    int
-	command []byte
+	Term    int
+	Command []byte
 }
 
 func deriveIdFromAddress(address string) int {

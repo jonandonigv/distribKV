@@ -1,11 +1,36 @@
 package raft
 
+// TODO: Implement complete leader election mechanism
+//
+// Missing Components:
+// - Election timer with randomized timeout (150-300ms)
+// - Timeout expiration triggers candidate transition
+// - Candidate increments term, votes for self, sends RequestVote RPCs
+// - Vote counting and majority detection
+// - Election safety: only one leader per term
+//
+// Election Flow:
+// 1. Follower timer expires -> become Candidate
+// 2. Candidate: increment term, vote for self, reset timer
+// 3. Send RequestVote to all peers concurrently
+// 4. Count votes: if majority -> become Leader
+// 5. If higher term seen -> step down to Follower
+// 6. If election timeout -> increment term, try again
+//
+// Key Methods Needed:
+// - startElectionTimer() - begin randomized countdown
+// - becomeCandidate() - transition to candidate state
+// - sendRequestVote(peerId int) - RPC to single peer
+// - countVotes() - tally responses and decide outcome
+
 import (
 	"context"
 
 	pb "github.com/jonandonigv/distribKV/proto/raft"
 )
 
+// RequestVote handles incoming vote requests from candidates.
+// Called when another server requests our vote.
 func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -40,7 +65,7 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		lastLogIndex := len(r.log) // 0 if empty, otherwise index of last entry
 		lastLogTerm := 0
 		if lastLogIndex > 0 {
-			lastLogTerm = r.log[lastLogIndex-1].term // Array is 0-based
+			lastLogTerm = r.log[lastLogIndex-1].Term // Array is 0-based
 		}
 
 		// Candidate's log is at least as up-to-date if:
@@ -55,3 +80,33 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 
 	return reply, nil
 }
+
+// TODO: Implement sendRequestVote(peerId int) method
+// - Called by candidate to request vote from specific peer
+// - Should be called concurrently for all peers
+// - Handle RPC failures (timeout, network error)
+// - Count successful votes toward majority
+// - Detect higher terms and step down
+// - Race-safe vote counting with mutex
+
+// TODO: Implement startElectionTimer() method
+// - Create randomized timeout (150-300ms)
+// - Reset on heartbeat received (valid leader)
+// - Reset on vote granted (valid candidate)
+// - On timeout: becomeCandidate() and start new election
+// - Use time.AfterFunc or goroutine with select
+
+// TODO: Implement becomeCandidate() method
+// - Increment currentTerm
+// - Vote for self
+// - Reset election timer
+// - Send RequestVote to all peers
+// - Transition to Candidate state
+// - Start vote counting
+
+// TODO: Implement stepDown(newTerm int) helper
+// - Update to higher term
+// - Reset votedFor
+// - Become Follower
+// - Reset election timer
+// - Called when higher term discovered
