@@ -38,7 +38,18 @@ type Raft struct {
 	commitIndex int
 	lastApplied int
 
-	// TODO: Election timer - randomized timeout (150-300ms)
+	// Election timer (goroutine + select approach)
+	electionResetChan       chan struct{}
+	electionStopChan        chan struct{}
+	electionTimeoutMin      time.Duration
+	electionTimeoutMax      time.Duration
+	useDeterministicTimeout bool
+	deterministicTimeout    time.Duration
+
+	// Vote counting (only used during candidacy)
+	votesReceived int
+	votesMutex    sync.Mutex
+
 	// TODO: Heartbeat ticker - leader sends AppendEntries periodically
 	// TODO: Apply channel - for committing entries to state machine
 }
@@ -71,13 +82,16 @@ func deriveIdFromAddress(address string) int {
 
 func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (*Raft, error) {
 	r := &Raft{
-		serverId:    serverId,
-		peers:       make(map[int]*Peer),
-		votedFor:    -1,
-		state:       Follower,
-		commitIndex: 0,
-		lastApplied: 0,
-		log:         make([]LogEntry, 0),
+		serverId:                serverId,
+		peers:                   make(map[int]*Peer),
+		votedFor:                -1,
+		state:                   Follower,
+		commitIndex:             0,
+		lastApplied:             0,
+		log:                     make([]LogEntry, 0),
+		electionTimeoutMin:      150 * time.Millisecond,
+		electionTimeoutMax:      300 * time.Millisecond,
+		useDeterministicTimeout: false,
 	}
 
 	for _, addr := range peerAddresses {
@@ -219,4 +233,36 @@ func isConnectionError(err error) bool {
 		strings.Contains(errStr, "no such host") ||
 		strings.Contains(errStr, "timeout") ||
 		strings.Contains(errStr, "deadline exceeded")
+}
+
+// Start initializes and starts the election timer goroutine.
+// Must be called after NewRaft() to begin the election process.
+func (r *Raft) Start() {
+	r.electionResetChan = make(chan struct{}, 10)
+	r.electionStopChan = make(chan struct{})
+	go r.runElectionTimer()
+}
+
+// SetDeterministicTimeout sets a fixed timeout for testing purposes.
+// When enabled, the election timer will use this fixed value instead of randomization.
+func (r *Raft) SetDeterministicTimeout(timeout time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.useDeterministicTimeout = true
+	r.deterministicTimeout = timeout
+}
+
+// getLastLogInfo returns the index and term of the last log entry.
+// Returns (0, 0) if log is empty.
+func (r *Raft) getLastLogInfo() (index int, term int) {
+	if len(r.log) == 0 {
+		return 0, 0
+	}
+	lastEntry := r.log[len(r.log)-1]
+	return int(lastEntry.Index), lastEntry.Term
+}
+
+// majorityCount returns the number of votes needed for a majority.
+func (r *Raft) majorityCount() int {
+	return (len(r.peers) + 1) / 2 + 1
 }

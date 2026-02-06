@@ -1,33 +1,204 @@
 package raft
 
-// TODO: Implement complete leader election mechanism
-//
-// Missing Components:
-// - Election timer with randomized timeout (150-300ms)
-// - Timeout expiration triggers candidate transition
-// - Candidate increments term, votes for self, sends RequestVote RPCs
-// - Vote counting and majority detection
-// - Election safety: only one leader per term
-//
-// Election Flow:
-// 1. Follower timer expires -> become Candidate
-// 2. Candidate: increment term, vote for self, reset timer
-// 3. Send RequestVote to all peers concurrently
-// 4. Count votes: if majority -> become Leader
-// 5. If higher term seen -> step down to Follower
-// 6. If election timeout -> increment term, try again
-//
-// Key Methods Needed:
-// - startElectionTimer() - begin randomized countdown
-// - becomeCandidate() - transition to candidate state
-// - sendRequestVote(peerId int) - RPC to single peer
-// - countVotes() - tally responses and decide outcome
-
 import (
 	"context"
+	"math/rand"
+	"time"
 
 	pb "github.com/jonandonigv/distribKV/proto/raft"
 )
+
+// runElectionTimer is the background goroutine that manages election timeouts.
+// It uses a select statement to handle timer expiration, reset signals, and stop signals.
+// When the timer expires, it triggers a new election by calling becomeCandidate().
+func (r *Raft) runElectionTimer() {
+	for {
+		// Calculate timeout duration
+		var timeout time.Duration
+		r.mu.Lock()
+		if r.useDeterministicTimeout {
+			timeout = r.deterministicTimeout
+		} else {
+			timeout = r.electionTimeoutMin + time.Duration(rand.Intn(int(r.electionTimeoutMax-r.electionTimeoutMin)))
+		}
+		r.mu.Unlock()
+
+		timer := time.NewTimer(timeout)
+
+		select {
+		case <-timer.C:
+			// Timer expired - start new election
+			r.becomeCandidate()
+
+		case <-r.electionResetChan:
+			// Reset requested - drain any additional reset signals and continue
+			timer.Stop()
+			select {
+			case <-r.electionResetChan:
+				// Drain additional resets
+			default:
+			}
+			continue
+
+		case <-r.electionStopChan:
+			// Stop requested - exit goroutine
+			timer.Stop()
+			return
+		}
+	}
+}
+
+// becomeCandidate transitions the node to candidate state and starts a new election.
+// It increments the term, votes for itself, resets the election timer, and sends
+// RequestVote RPCs to all peers concurrently.
+func (r *Raft) becomeCandidate() {
+	r.mu.Lock()
+
+	// Only become candidate if we're a follower or candidate
+	// (we might have already become leader or stepped down)
+	if r.state == Leader {
+		r.mu.Unlock()
+		return
+	}
+
+	// Increment term and vote for self
+	r.currentTerm++
+	r.votedFor = r.serverId
+	r.state = Candidate
+
+	// Reset vote count (self-vote = 1)
+	r.votesMutex.Lock()
+	r.votesReceived = 1
+	r.votesMutex.Unlock()
+
+	// Get current term for RPC calls
+	term := r.currentTerm
+	r.mu.Unlock()
+
+	// Reset election timer for this term (self-vote resets timer)
+	r.resetElectionTimer()
+
+	// Send RequestVote to all peers concurrently
+	for peerId := range r.peers {
+		go r.sendRequestVote(peerId, term)
+	}
+}
+
+// sendRequestVote sends a RequestVote RPC to a specific peer.
+// It handles RPC failures, vote grants, and higher term detection.
+func (r *Raft) sendRequestVote(peerId int, term int) {
+	// Get peer
+	peer, ok := r.peers[peerId]
+	if !ok {
+		return
+	}
+
+	// Get last log info
+	r.mu.Lock()
+	lastLogIndex, lastLogTerm := r.getLastLogInfo()
+	r.mu.Unlock()
+
+	// Build request
+	args := &pb.RequestVoteRequest{
+		Term:         int64(term),
+		CandidateId:  int32(r.serverId),
+		LastLogIndex: int64(lastLogIndex),
+		LastLogTerm:  int64(lastLogTerm),
+	}
+
+	// Make RPC call with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reply, err := peer.raftClient.RequestVote(ctx, args)
+	if err != nil {
+		// RPC failed - don't count this as a rejection
+		return
+	}
+
+	// Handle response
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check if term changed while we were waiting (election already finished)
+	if r.currentTerm != term {
+		return
+	}
+
+	// Check for higher term
+	if reply.Term > int64(r.currentTerm) {
+		r.stepDown(int(reply.Term))
+		return
+	}
+
+	// Check if vote was granted
+	if reply.VoteGranted {
+		r.votesMutex.Lock()
+		r.votesReceived++
+		votes := r.votesReceived
+		r.votesMutex.Unlock()
+
+		// Check if we have majority and are still a candidate
+		if votes > len(r.peers)/2 && r.state == Candidate {
+			r.becomeLeader()
+		}
+	}
+}
+
+// stepDown transitions the node to follower state with the given term.
+// It updates the term, resets votedFor, and resets the election timer.
+func (r *Raft) stepDown(newTerm int) {
+	r.currentTerm = newTerm
+	r.votedFor = -1
+	r.state = Follower
+	r.resetElectionTimer()
+}
+
+// resetElectionTimer sends a signal to reset the election timer.
+// This is non-blocking and handles the case where the channel is full.
+func (r *Raft) resetElectionTimer() {
+	select {
+	case r.electionResetChan <- struct{}{}:
+		// Signal sent successfully
+	default:
+		// Channel full, signal will be processed on next iteration
+	}
+}
+
+// stopElectionTimer sends a signal to stop the election timer goroutine.
+func (r *Raft) stopElectionTimer() {
+	select {
+	case <-r.electionStopChan:
+		// Already closed
+	default:
+		close(r.electionStopChan)
+	}
+}
+
+// becomeLeader transitions the node to leader state.
+// Called when candidate receives majority of votes.
+func (r *Raft) becomeLeader() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Double-check we're still a candidate
+	if r.state != Candidate {
+		return
+	}
+
+	r.state = Leader
+
+	// Stop election timer - leader doesn't need it
+	r.stopElectionTimer()
+
+	// Initialize leader state for each peer
+	for _, peer := range r.peers {
+		peer.nextIndex = len(r.log) + 1
+		peer.matchIndex = 0
+	}
+
+	// TODO: Start heartbeat sender goroutine
+}
 
 // RequestVote handles incoming vote requests from candidates.
 // Called when another server requests our vote.
@@ -51,7 +222,7 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		r.votedFor = -1
 		r.state = Follower
 		reply.Term = req.Term
-		// TODO: Reset election timer - we've heard from a valid leader/candidate
+		r.resetElectionTimer()
 	}
 
 	// TODO: Persist currentTerm and votedFor to stable storage before responding
@@ -79,51 +250,4 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 	}
 
 	return reply, nil
-}
-
-// TODO: Implement sendRequestVote(peerId int) method
-// - Called by candidate to request vote from specific peer
-// - Should be called concurrently for all peers
-// - Handle RPC failures (timeout, network error)
-// - Count successful votes toward majority
-// - Detect higher terms and step down
-// - Race-safe vote counting with mutex
-
-// TODO: Implement startElectionTimer() method
-// - Create randomized timeout (150-300ms)
-// - Reset on heartbeat received (valid leader)
-// - Reset on vote granted (valid candidate)
-// - On timeout: becomeCandidate() and start new election
-// - Use time.AfterFunc or goroutine with select
-
-// TODO: Implement becomeCandidate() method
-// - Increment currentTerm
-// - Vote for self
-// - Reset election timer
-// - Send RequestVote to all peers
-// - Transition to Candidate state
-// - Start vote counting
-
-// TODO: Implement stepDown(newTerm int) helper
-// - Update to higher term
-// - Reset votedFor
-// - Become Follower
-// - Reset election timer
-// - Called when higher term discovered
-
-// becomeLeader transitions the node to leader state.
-// Called when candidate receives majority of votes.
-func (r *Raft) becomeLeader() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	r.state = Leader
-
-	for _, peer := range r.peers {
-		peer.nextIndex = len(r.log) + 1
-		peer.matchIndex = 0
-	}
-
-	// TODO: Start heartbeat sender goroutine
-	// TODO: Stop election timer
 }

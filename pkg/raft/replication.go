@@ -54,13 +54,13 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		r.votedFor = -1
 		r.state = Follower
 		reply.Term = req.Term
-		// TODO: Reset election timer - we've heard from a valid leader
 	}
 
 	// TODO: Persist currentTerm to stable storage before responding
 	// (Raft requirement: persist state before responding to RPCs)
 
-	// TODO: Reset election timer - we've received valid heartbeat/append from leader
+	// Reset election timer - we've received valid heartbeat/append from leader
+	r.resetElectionTimer()
 
 	// Check if prevLogIndex matches
 	// prevLogIndex of 0 means leader has no previous log entry (empty log)
