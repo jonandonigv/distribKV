@@ -72,6 +72,11 @@ type Client struct {
 	conn   *grpc.ClientConn
 	target string
 	mu     sync.RWMutex
+	// TODO: Consider adding reconnection logic
+	// - Track connection health
+	// - Auto-reconnect on failure
+	// - Backoff strategy for retries
+	// - Connection pooling for multiple clients
 }
 
 func NewClient(target string) *Client {
