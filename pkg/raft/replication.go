@@ -1,30 +1,16 @@
 package raft
 
-// TODO: Implement complete log replication mechanism
-//
-// Missing Components:
-// - Leader heartbeat sender (periodic empty AppendEntries)
-// - Log entry appending from clients
-// - Commit index advancement and notification
-// - State machine application
-// - Log matching optimization
+// Package raft implements the Raft consensus algorithm.
+// It provides leader election, log replication, and state machine application.
 //
 // Replication Flow:
-// 1. Client submits command to leader
+// 1. Client submits command to leader via replicateCommand()
 // 2. Leader appends to local log
-// 3. Leader sends AppendEntries to all followers
+// 3. Leader sends AppendEntries to all followers via sendAppendEntries()
 // 4. Followers acknowledge or reject (log mismatch)
-// 5. Leader updates matchIndex on success
-// 6. Leader advances commitIndex when majority replicated
-// 7. Leader notifies followers of new commitIndex
-// 8. All nodes apply committed entries to state machine
-//
-// Key Methods Needed:
-// - StartHeartbeat() - leader periodically sends heartbeats
-// - SendAppendEntries(peerId int) - send to specific follower
-// - ReplicateCommand(cmd []byte) - client request handler
-// - UpdateCommitIndex() - advance commit on majority
-// - ApplyCommittedEntries() - apply to state machine
+// 5. Leader updates matchIndex/nextIndex on success
+// 6. Leader advances commitIndex when majority replicated via updateCommitIndex()
+// 7. Committed entries are applied to state machine via applyCommittedEntries()
 
 import (
 	"context"
@@ -141,21 +127,6 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 	return reply, nil
 }
 
-// TODO: Implement StartHeartbeat() method
-// - Only called when node becomes leader
-// - Send empty AppendEntries to all peers periodically (50-100ms)
-// - Prevent followers from starting elections
-// - Include commitIndex to notify followers of progress
-// - Stop when node steps down from leader
-
-// TODO: Implement sendAppendEntries(peerId int) method
-// - Send AppendEntries RPC to specific follower
-// - Include prevLogIndex, prevLogTerm for consistency check
-// - Send entries starting from nextIndex[peerId]
-// - Handle success: update matchIndex, nextIndex
-// - Handle failure (log mismatch): decrement nextIndex and retry
-// - Called by heartbeat loop and replication trigger
-
 // TODO: Implement replicateCommand(cmd []byte) method
 // - Called by KV server when client submits command
 // - Only accept if leader
@@ -163,21 +134,6 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 // - Trigger immediate replication to all peers
 // - Wait for commit or timeout
 // - Return success after commit
-
-// TODO: Implement updateCommitIndex() method
-// - Called after successful AppendEntries responses
-// - Find highest N where matchIndex[peer] >= N for majority
-// - Only advance if log[N].term == currentTerm
-// - Never commit entries from previous terms by counting
-// - Update commitIndex and notify followers
-// - Trigger state machine application
-
-// TODO: Implement applyCommittedEntries() method
-// - Background goroutine monitoring commitIndex
-// - Apply entries from lastApplied+1 to commitIndex
-// - Send applied entries to KV server via apply channel
-// - Update lastApplied after each successful apply
-// - Must be deterministic across all nodes
 
 // sendAppendEntries sends AppendEntries RPC to a specific peer.
 // It handles log replication, updating matchIndex/nextIndex on success,
