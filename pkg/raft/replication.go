@@ -109,15 +109,30 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 
 	// Update commitIndex if leaderCommit > commitIndex
 	// Note: logIndex is 1-based, commitIndex should also be 1-based
-	// CRITICAL BUG: Raft never commits log entries from previous terms by counting replicas
-	// We should only update commitIndex for entries from the current term
-	// TODO: Fix commit rule - only advance commitIndex for entries from currentTerm
+	// SAFETY: Raft never commits log entries from previous terms by counting replicas.
+	// We only advance commitIndex if the entry at that index is from the current term.
 	if req.LeaderCommit > int64(r.commitIndex) {
 		lastNewIndex := req.PrevLogIndex + int64(len(req.Entries)) // 1-based
-		if req.LeaderCommit < lastNewIndex {
-			r.commitIndex = int(req.LeaderCommit)
-		} else {
-			r.commitIndex = int(lastNewIndex)
+		newCommitIndex := req.LeaderCommit
+		if req.LeaderCommit > lastNewIndex {
+			newCommitIndex = lastNewIndex
+		}
+
+		// Only commit entries from the current term
+		// Entries from previous terms can only be committed indirectly once
+		// an entry from the current term is committed (Log Matching Property)
+		for i := r.commitIndex + 1; i <= int(newCommitIndex); i++ {
+			arrayIndex := i - 1 // Convert to 0-based
+			if arrayIndex >= len(r.log) {
+				// Don't have this entry yet, stop here
+				break
+			}
+			if r.log[arrayIndex].Term != r.currentTerm {
+				// Entry is from a previous term, don't commit it yet
+				// Wait until leader commits an entry from current term
+				break
+			}
+			r.commitIndex = i
 		}
 	}
 

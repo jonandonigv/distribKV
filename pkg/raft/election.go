@@ -139,7 +139,12 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		r.votesMutex.Unlock()
 
 		// Check if we have majority and are still a candidate
-		if votes > len(r.peers)/2 && r.state == Candidate {
+		// Must hold r.mu when reading r.state to avoid race condition
+		r.mu.Lock()
+		isCandidate := r.state == Candidate
+		r.mu.Unlock()
+
+		if votes > len(r.peers)/2 && isCandidate {
 			r.becomeLeader()
 		}
 	}
