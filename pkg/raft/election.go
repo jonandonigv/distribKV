@@ -202,7 +202,8 @@ func (r *Raft) becomeLeader() {
 		peer.matchIndex = 0
 	}
 
-	// TODO: Start heartbeat sender goroutine
+	// Start heartbeat sender goroutine
+	r.startHeartbeat()
 }
 
 // RequestVote handles incoming vote requests from candidates.
@@ -255,4 +256,49 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 	}
 
 	return reply, nil
+}
+
+// startHeartbeat initializes and starts the heartbeat sender goroutine.
+// Must be called when node becomes leader.
+func (r *Raft) startHeartbeat() {
+	r.heartbeatStopChan = make(chan struct{})
+	go r.runHeartbeat()
+}
+
+// stopHeartbeat signals the heartbeat sender goroutine to stop.
+// Must be called when leader steps down.
+func (r *Raft) stopHeartbeat() {
+	select {
+	case <-r.heartbeatStopChan:
+		// Already closed
+	default:
+		close(r.heartbeatStopChan)
+	}
+}
+
+// runHeartbeat is the background goroutine that sends periodic heartbeats to all peers.
+// It runs until stopHeartbeat is called.
+func (r *Raft) runHeartbeat() {
+	ticker := time.NewTicker(r.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Send heartbeat to all peers
+			r.mu.Lock()
+			if r.state != Leader {
+				r.mu.Unlock()
+				return
+			}
+			r.mu.Unlock()
+
+			for peerId := range r.peers {
+				go r.sendAppendEntries(peerId)
+			}
+
+		case <-r.heartbeatStopChan:
+			return
+		}
+	}
 }
