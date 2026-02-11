@@ -14,6 +14,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	pb "github.com/jonandonigv/distribKV/proto/raft"
@@ -42,9 +43,6 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		r.state = Follower
 		reply.Term = req.Term
 	}
-
-	// TODO: Persist currentTerm to stable storage before responding
-	// (Raft requirement: persist state before responding to RPCs)
 
 	// Reset election timer - we've received valid heartbeat/append from leader
 	r.resetElectionTimer()
@@ -121,6 +119,11 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 			}
 			r.commitIndex = i
 		}
+	}
+
+	// Persist state before responding (Raft requirement)
+	if err := r.persist(); err != nil {
+		return nil, fmt.Errorf("failed to persist state: %w", err)
 	}
 
 	reply.Success = true

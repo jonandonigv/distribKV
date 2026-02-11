@@ -3,6 +3,9 @@ package raft
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,6 +63,9 @@ type Raft struct {
 	// Apply channel for state machine
 	applyCh   chan ApplyMsg // Buffer size: 10
 	applyCond *sync.Cond    // Signals apply goroutine
+
+	// Persister for durability
+	persister *Persister
 }
 
 // ApplyMsg is sent to the application (KV service) when a log entry is committed.
@@ -132,6 +138,19 @@ func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (
 	// Establish connections to all peers
 	if err := r.ConnectPeers(connectCtx); err != nil {
 		return nil, err
+	}
+
+	// Initialize persister and load persisted state
+	dataDir := "./data"
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
+	r.persister = NewPersister(filepath.Join(dataDir, "raft-state.json"))
+
+	// Try to load existing state
+	if err := r.loadPersistedState(); err != nil {
+		// If load fails, start fresh but log warning
+		log.Printf("Warning: Could not load persisted state for server %d: %v", serverId, err)
 	}
 
 	// Initialize apply channel and conditions
@@ -319,7 +338,7 @@ func (r *Raft) applyCommittedEntries() {
 				Command:      entry.Command,
 				CommandIndex: int(entry.Index),
 			}
-			
+
 			// Send to apply channel (blocking)
 			r.applyCh <- msg
 
@@ -335,4 +354,40 @@ func (r *Raft) applyCommittedEntries() {
 // The application (KV service) should read from this channel.
 func (r *Raft) GetApplyCh() chan ApplyMsg {
 	return r.applyCh
+}
+
+// loadPersistedState loads state from disk if it exists.
+// If no persisted state exists, starts fresh.
+func (r *Raft) loadPersistedState() error {
+	currentTerm, votedFor, log, err := r.persister.Load()
+	if err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.currentTerm = currentTerm
+	r.votedFor = votedFor
+	r.log = log
+
+	// Initialize commitIndex and lastApplied based on loaded log
+	if len(r.log) > 0 {
+		r.lastApplied = int(r.log[len(r.log)-1].Index)
+		r.commitIndex = r.lastApplied
+	}
+
+	return nil
+}
+
+// persist saves the current state to disk.
+// Must be called before responding to any RPC.
+func (r *Raft) persist() error {
+	r.mu.Lock()
+	currentTerm := r.currentTerm
+	votedFor := r.votedFor
+	log := r.log
+	r.mu.Unlock()
+
+	return r.persister.Save(currentTerm, votedFor, log)
 }

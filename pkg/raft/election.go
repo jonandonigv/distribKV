@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -231,9 +232,6 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		r.resetElectionTimer()
 	}
 
-	// TODO: Persist currentTerm and votedFor to stable storage before responding
-	// (Raft requirement: persist state before responding to RPCs)
-
 	// Check if we can vote for this candidate
 	// Vote if: haven't voted yet, or already voted for this candidate
 	if r.votedFor == -1 || r.votedFor == int(req.CandidateId) {
@@ -253,6 +251,11 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 			r.votedFor = int(req.CandidateId)
 			reply.VoteGranted = true
 		}
+	}
+
+	// Persist state before responding (Raft requirement)
+	if err := r.persist(); err != nil {
+		return nil, fmt.Errorf("failed to persist state: %w", err)
 	}
 
 	return reply, nil
