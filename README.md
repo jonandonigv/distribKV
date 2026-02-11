@@ -7,13 +7,54 @@ A distributed key-value store built with the Raft consensus algorithm in Go. Whi
 distribKV provides a fault-tolerant, strongly consistent key-value store through Raft consensus. All nodes agree on the order of operations, ensuring linearizability even during network partitions and node failures.
 
 **Key Features:**
-- Raft consensus for leader election and log replication
-- Strong consistency (linearizable reads/writes)
-- Fault tolerance with automatic leader election
-- Crash recovery with state persistence
-- Log compaction via snapshotting
+- ✅ Raft consensus for leader election and log replication
+- ✅ Strong consistency (linearizable reads/writes)
+- ✅ Fault tolerance with automatic leader election
+- ✅ Crash recovery with state persistence
+- 🔄 Log compaction via snapshotting (planned)
+- 🔄 Key-Value service layer (planned)
 
-## Background
+## Current Implementation Status
+
+### ✅ Completed (Core Raft)
+
+**Leader Election**
+- Randomized timeouts (150-300ms)
+- Vote counting with proper mutex protection
+- Timer reset on valid leader communication
+- Election safety: only one leader per term
+
+**Log Replication**
+- Heartbeat sender (50ms intervals)
+- AppendEntries RPC with log matching
+- Conflict detection and log truncation
+- nextIndex/matchIndex tracking per peer
+- Automatic retry on mismatch
+
+**Persistence Layer**
+- JSON format with base64 encoding
+- Atomic writes (temp file + fsync + rename)
+- Automatic state recovery on startup
+- Data directory: `./data/raft-state.json`
+
+**State Machine Integration**
+- Apply channel for committed entries
+- Background apply goroutine
+- Proper lastApplied tracking
+
+### 🔄 In Progress / Planned
+
+**Client Interface**
+- `ReplicateCommand()` API implemented
+- KV service integration pending
+
+**Future Work**
+- Log compaction and snapshotting
+- KV service layer (Put/Get/Append)
+- Production server binary
+- Comprehensive test suite
+
+## Architecture
 
 ### Consensus & Raft
 
@@ -84,20 +125,11 @@ go test ./pkg/raft -run TestElection -v
 go test -race -cover ./...
 ```
 
-### Starting a Cluster
-
-```bash
-# Start 3-node cluster (in separate terminals)
-./bin/kvserver -id 1 -peers localhost:10001,localhost:10002,localhost:10003 &
-./bin/kvserver -id 2 -peers localhost:10001,localhost:10002,localhost:10003 &
-./bin/kvserver -id 3 -peers localhost:10001,localhost:10002,localhost:10003 &
-```
-
-## Testing gRPC Infrastructure
+### Testing gRPC Infrastructure
 
 The project includes CLI tools to test the gRPC communication layer using a standard Health Check service.
 
-### Start Server
+#### Start Server
 
 ```bash
 # Start on default port (50051)
@@ -111,7 +143,7 @@ Server options:
 - `--port` - Server port (default: 50051)
 - `--id` - Server identifier for logging (default: "1")
 
-### Run Client
+#### Run Client
 
 **Single Request Mode (default):**
 
@@ -135,7 +167,7 @@ Continuous mode options:
 - `--addr` - Server address (default: localhost:50051)
 - `--id` - Client identifier for logging (default: "client")
 
-### Multi-Client Testing
+#### Multi-Client Testing
 
 Test concurrent client connections:
 
@@ -155,7 +187,7 @@ Test concurrent client connections:
 
 Each client logs its own statistics including success rate and average latency.
 
-### Graceful Shutdown
+#### Graceful Shutdown
 
 Both server and client respond to `SIGINT` (Ctrl+C) and `SIGTERM` signals gracefully.
 
@@ -177,60 +209,205 @@ distribKV/
 │   │   └── main.go
 │   ├── grpc-test-client/   # gRPC Health Check client (testing)
 │   │   └── main.go
-│   └── raft-kv-server/    # Main KV server (future)
+│   └── raft-kv-server/    # Main KV server (planned)
 ├── pkg/
 │   ├── common/
 │   │   └── grpc.go        # gRPC server/client utilities
 │   ├── health/
 │   │   └── health.go      # Health Check service implementation
-│   ├── raft/
-│   │   ├── raft.go        # Main Raft implementation
-│   │   ├── election.go    # Leader election logic
-│   │   ├── replication.go  # Log replication
-│   │   └── persistence.go # State persistence
-│   └── kvserver/
-│       ├── server.go      # KV service on Raft
-│       └── clerk.go       # Client library
+│   ├── raft/              # ✅ Core Raft implementation (COMPLETE)
+│   │   ├── raft.go        # Main Raft struct and initialization
+│   │   ├── election.go    # Leader election and timers
+│   │   ├── replication.go # Log replication and heartbeat
+│   │   └── persistence.go # State persistence to disk
+│   └── kvserver/          # 🔄 KV service (NOT IMPLEMENTED)
+│       ├── server.go      # TODO: KV service on Raft
+│       └── clerk.go       # TODO: Client library
 ├── proto/
+│   ├── raft.proto         # Raft RPC definitions
+│   ├── raft.pb.go         # Generated messages
+│   ├── raft_grpc.pb.go    # Generated service interfaces
 │   ├── health.proto       # Health Check service definition
-│   ├── health.pb.go      # Generated messages
-│   └── health_grpc.pb.go # Generated service interfaces
+│   └── health_grpc.pb.go  # Generated service interfaces
 ├── bin/
-│   ├── grpc-test-server   # Compiled server binary
-│   └── grpc-test-client   # Compiled client binary
+│   ├── grpc-test-server   # Compiled test server
+│   ├── grpc-test-client   # Compiled test client
+│   └── test-connect       # Raft connection test tool
+├── data/                  # Persistent state storage
+│   └── raft-state.json    # Raft state file
 ├── Makefile               # Build convenience targets
 ├── configs/
 │   └── cluster.yaml       # Cluster configuration
 └── scripts/
-    ├── start-cluster.sh   # Start multi-node cluster
-    └── test-cluster.sh    # Run tests
+    ├── start-cluster.sh   # Start multi-node cluster (planned)
+    └── test-cluster.sh    # Run tests (planned)
 ```
 
-## Usage
+## API Reference
 
-### Basic Operations
+### Core Raft API
+
+The Raft consensus layer is implemented in `pkg/raft/` and provides the following public API:
+
+#### Creating a Raft Node
 
 ```go
-// Create client
-clerk := kvserver.NewClerk([]string{"localhost:10001", "localhost:10002", "localhost:10003"})
+import (
+    "context"
+    "time"
+    "github.com/jonandonigv/distribKV/pkg/raft"
+)
+
+// Create a new Raft node
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+r, err := raft.NewRaft(
+    1,  // Server ID
+    []string{"localhost:10001", "localhost:10002", "localhost:10003"},  // Peer addresses
+    ctx,  // Connection context
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+// Start the election timer (must be called explicitly)
+r.Start()
+```
+
+#### Submitting Commands (ReplicateCommand)
+
+```go
+// Submit a command to the Raft log
+// Only the leader accepts commands
+command := []byte("your-command-data")
+index, err := r.ReplicateCommand(command)
+
+if err == raft.ErrNotLeader {
+    // This node is not the leader
+    // The client should retry with another node
+    log.Println("Not leader, retry with another node")
+    return
+}
+
+if err == raft.ErrTimeout {
+    // Timeout waiting for commit (5 seconds)
+    // The command may still commit later via heartbeat
+    // The index is returned so you can poll for status
+    log.Printf("Timeout, but command may still commit at index %d", index)
+    return
+}
+
+if err != nil {
+    // Other error (persistence failure, etc.)
+    log.Printf("Error: %v", err)
+    return
+}
+
+// Success! Command committed at index
+log.Printf("Command committed at index %d", index)
+```
+
+**ReplicateCommand Details:**
+
+- **Blocking call** - Waits until committed or timeout
+- **5-second timeout** - Returns `ErrTimeout` if not committed in time
+- **Leader check** - Returns `ErrNotLeader` immediately if not leader
+- **Returns index** - Even on timeout, returns the log index for polling
+- **Automatic persistence** - State persisted before returning
+- **Immediate replication** - Triggers AppendEntries to all peers
+
+#### Receiving Applied Commands
+
+```go
+// Get the apply channel
+applyCh := r.GetApplyCh()
+
+// Read committed commands
+for msg := range applyCh {
+    if msg.CommandValid {
+        // Apply the command to your state machine
+        fmt.Printf("Applying command at index %d: %v\n", 
+            msg.CommandIndex, msg.Command)
+        
+        // Your application logic here
+        // e.g., update key-value store
+    }
+}
+```
+
+**ApplyMsg Structure:**
+
+```go
+type ApplyMsg struct {
+    CommandValid bool   // True if command is valid
+    Command      []byte // The command data
+    CommandIndex int    // Log index where command is stored
+}
+```
+
+#### Testing Utilities
+
+```go
+// Use deterministic timeout for testing (100ms instead of 150-300ms)
+r.SetDeterministicTimeout(100 * time.Millisecond)
+```
+
+### Future: Key-Value Service (NOT YET IMPLEMENTED)
+
+The KV service layer will be built on top of the Raft consensus layer:
+
+```go
+// Planned API (not yet implemented)
+clerk := kvserver.NewClerk([]string{
+    "localhost:10001", 
+    "localhost:10002", 
+    "localhost:10003",
+})
 
 // Put operation
 clerk.Put("foo", "bar")
 
-// Get operation
+// Get operation  
 value := clerk.Get("foo") // returns "bar"
 
 // Append operation
-clerk.Append("foo", "-baz") // foo becomes "bar-baz"
+clerk.Append("foo", "-baz")
 ```
 
 ## Learning Phases
 
+### ✅ Completed
+
 1. **Phase 1**: Raft Foundation - Leader election and heartbeats
+   - Randomized election timeouts (150-300ms)
+   - Vote counting with proper safety
+   - Timer reset on valid leader communication
+
 2. **Phase 2**: Log Replication - Replicate client commands across cluster
+   - Heartbeat sender (50ms intervals)
+   - AppendEntries RPC with log matching
+   - Conflict detection and resolution
+   - Automatic retry on mismatch
+
 3. **Phase 3**: Persistence - Crash recovery using persistent storage
+   - JSON format with base64 encoding
+   - Atomic writes (temp file + fsync + rename)
+   - Automatic state recovery on startup
+
+### 🔄 Current / Next
+
 4. **Phase 4**: Key-Value Service - Build KV store on top of Raft
+   - ✅ `ReplicateCommand()` API implemented
+   - 🔄 KV server integration pending
+   - 🔄 Client library (Clerk) pending
+
+### 📋 Planned
+
 5. **Phase 5**: Snapshotting - Log compaction and faster recovery
+   - InstallSnapshot RPC
+   - Log truncation
+   - State machine snapshots
 
 ## Resources
 
