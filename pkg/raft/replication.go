@@ -130,13 +130,67 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 	return reply, nil
 }
 
-// TODO: Implement replicateCommand(cmd []byte) method
-// - Called by KV server when client submits command
-// - Only accept if leader
-// - Append to local log
-// - Trigger immediate replication to all peers
-// - Wait for commit or timeout
-// - Return success after commit
+// ReplicateCommand submits a command to the Raft log.
+// Only the leader accepts commands. Non-leaders return ErrNotLeader.
+// Blocks until the command is committed or timeout occurs (5 seconds).
+// Returns the log index even on timeout (client can poll for commit status).
+//
+// Errors:
+//   - ErrNotLeader: This node is not the leader
+//   - ErrTimeout: Command not committed within timeout (may still commit later)
+func (r *Raft) ReplicateCommand(cmd []byte) (int, error) {
+	// Check if leader
+	r.mu.Lock()
+	if r.state != Leader {
+		r.mu.Unlock()
+		return 0, ErrNotLeader
+	}
+
+	// Calculate next log index
+	nextIndex := len(r.log) + 1
+
+	// Append to local log
+	entry := LogEntry{
+		Index:   int64(nextIndex),
+		Term:    r.currentTerm,
+		Command: cmd,
+	}
+	r.log = append(r.log, entry)
+
+	// Persist immediately (critical for durability)
+	if err := r.persist(); err != nil {
+		r.mu.Unlock()
+		return 0, fmt.Errorf("failed to persist: %w", err)
+	}
+
+	// Trigger immediate replication to all peers
+	for peerId := range r.peers {
+		go r.sendAppendEntries(peerId)
+	}
+
+	// Remember target index and release lock
+	targetIndex := nextIndex
+	r.mu.Unlock()
+
+	// Wait for commit with timeout (5 seconds)
+	timeout := time.After(5 * time.Second)
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			return targetIndex, ErrTimeout
+		case <-ticker.C:
+			r.mu.Lock()
+			committed := r.commitIndex >= targetIndex
+			r.mu.Unlock()
+			if committed {
+				return targetIndex, nil
+			}
+		}
+	}
+}
 
 // sendAppendEntries sends AppendEntries RPC to a specific peer.
 // It handles log replication, updating matchIndex/nextIndex on success,
