@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,6 +14,12 @@ import (
 
 	"github.com/jonandonigv/distribKV/pkg/common"
 	pb "github.com/jonandonigv/distribKV/proto/raft"
+)
+
+// Replication errors
+var (
+	ErrNotLeader = errors.New("not leader")
+	ErrTimeout   = errors.New("timeout waiting for commit")
 )
 
 type Peer struct {
