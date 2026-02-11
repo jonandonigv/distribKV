@@ -3,6 +3,9 @@ package raft
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,8 +53,26 @@ type Raft struct {
 	votesReceived int
 	votesMutex    sync.Mutex
 
-	// TODO: Heartbeat ticker - leader sends AppendEntries periodically
-	// TODO: Apply channel - for committing entries to state machine
+	// Heartbeat sender (leader only)
+	heartbeatStopChan chan struct{}
+	heartbeatInterval time.Duration // 50ms
+
+	// Replication coordination
+	replicationCond *sync.Cond // Signals when commitIndex advances
+
+	// Apply channel for state machine
+	applyCh   chan ApplyMsg // Buffer size: 10
+	applyCond *sync.Cond    // Signals apply goroutine
+
+	// Persister for durability
+	persister *Persister
+}
+
+// ApplyMsg is sent to the application (KV service) when a log entry is committed.
+type ApplyMsg struct {
+	CommandValid bool
+	Command      []byte
+	CommandIndex int
 }
 
 type State int
@@ -92,6 +113,7 @@ func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (
 		electionTimeoutMin:      150 * time.Millisecond,
 		electionTimeoutMax:      300 * time.Millisecond,
 		useDeterministicTimeout: false,
+		heartbeatInterval:       50 * time.Millisecond,
 	}
 
 	for _, addr := range peerAddresses {
@@ -117,6 +139,27 @@ func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (
 	if err := r.ConnectPeers(connectCtx); err != nil {
 		return nil, err
 	}
+
+	// Initialize persister and load persisted state
+	dataDir := "./data"
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create data directory: %w", err)
+	}
+	r.persister = NewPersister(filepath.Join(dataDir, "raft-state.json"))
+
+	// Try to load existing state
+	if err := r.loadPersistedState(); err != nil {
+		// If load fails, start fresh but log warning
+		log.Printf("Warning: Could not load persisted state for server %d: %v", serverId, err)
+	}
+
+	// Initialize apply channel and conditions
+	r.applyCh = make(chan ApplyMsg, 10)
+	r.replicationCond = sync.NewCond(&r.mu)
+	r.applyCond = sync.NewCond(&r.mu)
+
+	// Start apply goroutine
+	go r.applyCommittedEntries()
 
 	return r, nil
 }
@@ -264,5 +307,87 @@ func (r *Raft) getLastLogInfo() (index int, term int) {
 
 // majorityCount returns the number of votes needed for a majority.
 func (r *Raft) majorityCount() int {
-	return (len(r.peers) + 1) / 2 + 1
+	return (len(r.peers)+1)/2 + 1
+}
+
+// applyCommittedEntries is a background goroutine that applies committed log entries
+// to the state machine. It runs continuously and sends applied entries via applyCh.
+func (r *Raft) applyCommittedEntries() {
+	for {
+		r.mu.Lock()
+
+		// Wait until there are entries to apply
+		for r.lastApplied >= r.commitIndex {
+			r.applyCond.Wait()
+		}
+
+		// Get entries to apply
+		entriesToApply := make([]LogEntry, 0)
+		for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
+			arrayIndex := i - 1 // Convert to 0-based
+			if arrayIndex < len(r.log) {
+				entriesToApply = append(entriesToApply, r.log[arrayIndex])
+			}
+		}
+		r.mu.Unlock()
+
+		// Apply entries outside of lock
+		for _, entry := range entriesToApply {
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: int(entry.Index),
+			}
+
+			// Send to apply channel (blocking)
+			r.applyCh <- msg
+
+			// Update lastApplied
+			r.mu.Lock()
+			r.lastApplied = int(entry.Index)
+			r.mu.Unlock()
+		}
+	}
+}
+
+// GetApplyCh returns the channel for receiving applied log entries.
+// The application (KV service) should read from this channel.
+func (r *Raft) GetApplyCh() chan ApplyMsg {
+	return r.applyCh
+}
+
+// loadPersistedState loads state from disk if it exists.
+// If no persisted state exists, starts fresh.
+func (r *Raft) loadPersistedState() error {
+	currentTerm, votedFor, log, err := r.persister.Load()
+	if err != nil {
+		return err
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.currentTerm = currentTerm
+	r.votedFor = votedFor
+	r.log = log
+
+	// Initialize commitIndex and lastApplied based on loaded log
+	if len(r.log) > 0 {
+		r.lastApplied = int(r.log[len(r.log)-1].Index)
+		r.commitIndex = r.lastApplied
+	}
+
+	return nil
+}
+
+// persist saves the current state to disk.
+// Must be called before responding to any RPC.
+func (r *Raft) persist() error {
+	r.mu.Lock()
+	currentTerm := r.currentTerm
+	votedFor := r.votedFor
+	log := r.log
+	r.mu.Unlock()
+
+	return r.persister.Save(currentTerm, votedFor, log)
 }

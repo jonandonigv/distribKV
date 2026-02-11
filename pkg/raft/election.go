@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -139,7 +140,12 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		r.votesMutex.Unlock()
 
 		// Check if we have majority and are still a candidate
-		if votes > len(r.peers)/2 && r.state == Candidate {
+		// Must hold r.mu when reading r.state to avoid race condition
+		r.mu.Lock()
+		isCandidate := r.state == Candidate
+		r.mu.Unlock()
+
+		if votes > len(r.peers)/2 && isCandidate {
 			r.becomeLeader()
 		}
 	}
@@ -197,7 +203,8 @@ func (r *Raft) becomeLeader() {
 		peer.matchIndex = 0
 	}
 
-	// TODO: Start heartbeat sender goroutine
+	// Start heartbeat sender goroutine
+	r.startHeartbeat()
 }
 
 // RequestVote handles incoming vote requests from candidates.
@@ -225,9 +232,6 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		r.resetElectionTimer()
 	}
 
-	// TODO: Persist currentTerm and votedFor to stable storage before responding
-	// (Raft requirement: persist state before responding to RPCs)
-
 	// Check if we can vote for this candidate
 	// Vote if: haven't voted yet, or already voted for this candidate
 	if r.votedFor == -1 || r.votedFor == int(req.CandidateId) {
@@ -249,5 +253,55 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		}
 	}
 
+	// Persist state before responding (Raft requirement)
+	if err := r.persist(); err != nil {
+		return nil, fmt.Errorf("failed to persist state: %w", err)
+	}
+
 	return reply, nil
+}
+
+// startHeartbeat initializes and starts the heartbeat sender goroutine.
+// Must be called when node becomes leader.
+func (r *Raft) startHeartbeat() {
+	r.heartbeatStopChan = make(chan struct{})
+	go r.runHeartbeat()
+}
+
+// stopHeartbeat signals the heartbeat sender goroutine to stop.
+// Must be called when leader steps down.
+func (r *Raft) stopHeartbeat() {
+	select {
+	case <-r.heartbeatStopChan:
+		// Already closed
+	default:
+		close(r.heartbeatStopChan)
+	}
+}
+
+// runHeartbeat is the background goroutine that sends periodic heartbeats to all peers.
+// It runs until stopHeartbeat is called.
+func (r *Raft) runHeartbeat() {
+	ticker := time.NewTicker(r.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Send heartbeat to all peers
+			r.mu.Lock()
+			if r.state != Leader {
+				r.mu.Unlock()
+				return
+			}
+			r.mu.Unlock()
+
+			for peerId := range r.peers {
+				go r.sendAppendEntries(peerId)
+			}
+
+		case <-r.heartbeatStopChan:
+			return
+		}
+	}
 }

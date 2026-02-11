@@ -1,33 +1,21 @@
 package raft
 
-// TODO: Implement complete log replication mechanism
-//
-// Missing Components:
-// - Leader heartbeat sender (periodic empty AppendEntries)
-// - Log entry appending from clients
-// - Commit index advancement and notification
-// - State machine application
-// - Log matching optimization
+// Package raft implements the Raft consensus algorithm.
+// It provides leader election, log replication, and state machine application.
 //
 // Replication Flow:
-// 1. Client submits command to leader
+// 1. Client submits command to leader via replicateCommand()
 // 2. Leader appends to local log
-// 3. Leader sends AppendEntries to all followers
+// 3. Leader sends AppendEntries to all followers via sendAppendEntries()
 // 4. Followers acknowledge or reject (log mismatch)
-// 5. Leader updates matchIndex on success
-// 6. Leader advances commitIndex when majority replicated
-// 7. Leader notifies followers of new commitIndex
-// 8. All nodes apply committed entries to state machine
-//
-// Key Methods Needed:
-// - StartHeartbeat() - leader periodically sends heartbeats
-// - SendAppendEntries(peerId int) - send to specific follower
-// - ReplicateCommand(cmd []byte) - client request handler
-// - UpdateCommitIndex() - advance commit on majority
-// - ApplyCommittedEntries() - apply to state machine
+// 5. Leader updates matchIndex/nextIndex on success
+// 6. Leader advances commitIndex when majority replicated via updateCommitIndex()
+// 7. Committed entries are applied to state machine via applyCommittedEntries()
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	pb "github.com/jonandonigv/distribKV/proto/raft"
 )
@@ -55,9 +43,6 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		r.state = Follower
 		reply.Term = req.Term
 	}
-
-	// TODO: Persist currentTerm to stable storage before responding
-	// (Raft requirement: persist state before responding to RPCs)
 
 	// Reset election timer - we've received valid heartbeat/append from leader
 	r.resetElectionTimer()
@@ -109,36 +94,41 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 
 	// Update commitIndex if leaderCommit > commitIndex
 	// Note: logIndex is 1-based, commitIndex should also be 1-based
-	// CRITICAL BUG: Raft never commits log entries from previous terms by counting replicas
-	// We should only update commitIndex for entries from the current term
-	// TODO: Fix commit rule - only advance commitIndex for entries from currentTerm
+	// SAFETY: Raft never commits log entries from previous terms by counting replicas.
+	// We only advance commitIndex if the entry at that index is from the current term.
 	if req.LeaderCommit > int64(r.commitIndex) {
 		lastNewIndex := req.PrevLogIndex + int64(len(req.Entries)) // 1-based
-		if req.LeaderCommit < lastNewIndex {
-			r.commitIndex = int(req.LeaderCommit)
-		} else {
-			r.commitIndex = int(lastNewIndex)
+		newCommitIndex := req.LeaderCommit
+		if req.LeaderCommit > lastNewIndex {
+			newCommitIndex = lastNewIndex
 		}
+
+		// Only commit entries from the current term
+		// Entries from previous terms can only be committed indirectly once
+		// an entry from the current term is committed (Log Matching Property)
+		for i := r.commitIndex + 1; i <= int(newCommitIndex); i++ {
+			arrayIndex := i - 1 // Convert to 0-based
+			if arrayIndex >= len(r.log) {
+				// Don't have this entry yet, stop here
+				break
+			}
+			if r.log[arrayIndex].Term != r.currentTerm {
+				// Entry is from a previous term, don't commit it yet
+				// Wait until leader commits an entry from current term
+				break
+			}
+			r.commitIndex = i
+		}
+	}
+
+	// Persist state before responding (Raft requirement)
+	if err := r.persist(); err != nil {
+		return nil, fmt.Errorf("failed to persist state: %w", err)
 	}
 
 	reply.Success = true
 	return reply, nil
 }
-
-// TODO: Implement StartHeartbeat() method
-// - Only called when node becomes leader
-// - Send empty AppendEntries to all peers periodically (50-100ms)
-// - Prevent followers from starting elections
-// - Include commitIndex to notify followers of progress
-// - Stop when node steps down from leader
-
-// TODO: Implement sendAppendEntries(peerId int) method
-// - Send AppendEntries RPC to specific follower
-// - Include prevLogIndex, prevLogTerm for consistency check
-// - Send entries starting from nextIndex[peerId]
-// - Handle success: update matchIndex, nextIndex
-// - Handle failure (log mismatch): decrement nextIndex and retry
-// - Called by heartbeat loop and replication trigger
 
 // TODO: Implement replicateCommand(cmd []byte) method
 // - Called by KV server when client submits command
@@ -148,17 +138,130 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 // - Wait for commit or timeout
 // - Return success after commit
 
-// TODO: Implement updateCommitIndex() method
-// - Called after successful AppendEntries responses
-// - Find highest N where matchIndex[peer] >= N for majority
-// - Only advance if log[N].term == currentTerm
-// - Never commit entries from previous terms by counting
-// - Update commitIndex and notify followers
-// - Trigger state machine application
+// sendAppendEntries sends AppendEntries RPC to a specific peer.
+// It handles log replication, updating matchIndex/nextIndex on success,
+// and retrying with decremented nextIndex on log mismatch.
+func (r *Raft) sendAppendEntries(peerId int) {
+	peer, ok := r.peers[peerId]
+	if !ok {
+		return
+	}
 
-// TODO: Implement applyCommittedEntries() method
-// - Background goroutine monitoring commitIndex
-// - Apply entries from lastApplied+1 to commitIndex
-// - Send applied entries to KV server via apply channel
-// - Update lastApplied after each successful apply
-// - Must be deterministic across all nodes
+	r.mu.Lock()
+	if r.state != Leader {
+		r.mu.Unlock()
+		return
+	}
+
+	// Get nextIndex for this peer
+	nextIndex := peer.nextIndex
+	if nextIndex < 1 {
+		nextIndex = 1
+	}
+
+	// Build prevLog info
+	prevLogIndex := nextIndex - 1
+	prevLogTerm := 0
+	if prevLogIndex > 0 && prevLogIndex <= len(r.log) {
+		prevLogTerm = r.log[prevLogIndex-1].Term
+	}
+
+	// Get entries to send (starting from nextIndex)
+	entries := make([]*pb.LogEntry, 0)
+	for i := nextIndex; i <= len(r.log); i++ {
+		entry := r.log[i-1]
+		entries = append(entries, &pb.LogEntry{
+			Index:   entry.Index,
+			Term:    int64(entry.Term),
+			Command: entry.Command,
+		})
+	}
+
+	args := &pb.AppendEntriesRequest{
+		Term:         int64(r.currentTerm),
+		LeaderId:     int32(r.serverId),
+		PrevLogIndex: int64(prevLogIndex),
+		PrevLogTerm:  int64(prevLogTerm),
+		Entries:      entries,
+		LeaderCommit: int64(r.commitIndex),
+	}
+	r.mu.Unlock()
+
+	// Make RPC call with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reply, err := peer.raftClient.AppendEntries(ctx, args)
+	if err != nil {
+		// RPC failed - will retry on next heartbeat
+		return
+	}
+
+	// Handle response
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Check if we're still leader and term hasn't changed
+	if r.state != Leader || r.currentTerm != int(args.Term) {
+		return
+	}
+
+	// Check for higher term
+	if reply.Term > int64(r.currentTerm) {
+		r.stepDown(int(reply.Term))
+		return
+	}
+
+	if reply.Success {
+		// Update matchIndex and nextIndex
+		newMatchIndex := prevLogIndex + len(entries)
+		if newMatchIndex > peer.matchIndex {
+			peer.matchIndex = newMatchIndex
+		}
+		peer.nextIndex = peer.matchIndex + 1
+
+		// Try to advance commit index
+		r.updateCommitIndex()
+	} else {
+		// Log mismatch - decrement nextIndex and retry
+		if peer.nextIndex > 1 {
+			peer.nextIndex--
+		}
+		// Trigger immediate retry
+		go r.sendAppendEntries(peerId)
+	}
+}
+
+// updateCommitIndex finds the highest N where matchIndex[peer] >= N for majority,
+// and advances commitIndex if log[N].term == currentTerm.
+func (r *Raft) updateCommitIndex() {
+	if r.state != Leader {
+		return
+	}
+
+	// Find highest N where a majority has matchIndex >= N
+	for n := r.commitIndex + 1; n <= len(r.log); n++ {
+		// Count how many peers have replicated entry N
+		count := 1 // Leader always has the entry
+		for _, peer := range r.peers {
+			if peer.matchIndex >= n {
+				count++
+			}
+		}
+
+		// Check if we have majority
+		if count > len(r.peers)/2 {
+			// Only commit if entry is from current term (Raft safety)
+			if r.log[n-1].Term == r.currentTerm {
+				r.commitIndex = n
+				// Signal apply goroutine
+				r.applyCond.Broadcast()
+				// Signal any waiters for replication
+				r.replicationCond.Broadcast()
+			}
+		} else {
+			// No majority for this entry or higher
+			break
+		}
+	}
+}
