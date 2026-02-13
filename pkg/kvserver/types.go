@@ -11,10 +11,16 @@ import (
 )
 
 var (
-	ErrNotLeader   = errors.New("not leader")
-	ErrTimeout     = errors.New("timeout waiting for commit")
-	ErrKeyNotFound = errors.New("key not found")
-	ErrDuplicate   = errors.New("duplicate operation")
+	ErrNotLeader      = errors.New("not leader")
+	ErrTimeout        = errors.New("timeout waiting for commit")
+	ErrKeyNotFound    = errors.New("key not found")
+	ErrDuplicate      = errors.New("duplicate operation")
+	ErrTooManyPending = errors.New("too many pending operations")
+)
+
+const (
+	DefaultMaxPendingOps = 1000
+	RPCTimeout           = 5 * time.Second
 )
 
 type OpType int
@@ -51,15 +57,16 @@ type DuplicateEntry struct {
 }
 
 type KVServer struct {
-	mu         sync.Mutex
-	rf         *raft.Raft
-	applyCh    chan raft.ApplyMsg
-	state      map[string]string
-	duplicates map[int64]map[int64]*DuplicateEntry
-	pendingOps map[int]*PendingOp
-	leaderId   int
-	dead       bool
-	shutdownCh chan struct{}
+	mu            sync.Mutex
+	rf            *raft.Raft
+	applyCh       chan raft.ApplyMsg
+	state         map[string]string
+	duplicates    map[int64]map[int64]*DuplicateEntry
+	pendingOps    map[int]*PendingOp
+	maxPendingOps int
+	leaderId      int
+	dead          bool
+	shutdownCh    chan struct{}
 }
 
 type Clerk struct {
