@@ -3,6 +3,7 @@ package kvserver
 import (
 	"errors"
 	"sync"
+	"time"
 
 	"github.com/jonandonigv/distribKV/pkg/raft"
 	pb "github.com/jonandonigv/distribKV/proto/kv"
@@ -43,12 +44,18 @@ type PendingOp struct {
 	ResultCh chan Result
 }
 
+// DuplicateEntry tracks completed operations with timestamp for cache eviction
+type DuplicateEntry struct {
+	Result    Result
+	Timestamp time.Time
+}
+
 type KVServer struct {
 	mu         sync.Mutex
 	rf         *raft.Raft
 	applyCh    chan raft.ApplyMsg
 	state      map[string]string
-	duplicates map[int64]map[int64]Result
+	duplicates map[int64]map[int64]*DuplicateEntry
 	pendingOps map[int]*PendingOp
 	leaderId   int
 	dead       bool
