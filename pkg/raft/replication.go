@@ -44,6 +44,9 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		reply.Term = req.Term
 	}
 
+	// Track the leader (valid AppendEntries with current or higher term)
+	r.leaderId = int(req.LeaderId)
+
 	// Reset election timer - we've received valid heartbeat/append from leader
 	r.resetElectionTimer()
 
