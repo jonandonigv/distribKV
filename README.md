@@ -152,7 +152,30 @@ go build -o bin/ ./cmd/...
 
 ### Running a Cluster
 
-Start a 3-node cluster:
+#### Quick Start with Scripts
+
+The easiest way to run a cluster is using the provided scripts:
+
+```bash
+# Start a 3-node cluster
+./scripts/start-cluster.sh
+
+# Or with verbose logging
+./scripts/start-cluster.sh -v
+
+# Test the cluster
+./scripts/test-cluster.sh
+```
+
+The startup script will:
+- Start all 3 servers simultaneously
+- Create separate data directories for each node
+- Show server status and log locations
+- Handle graceful shutdown on Ctrl+C
+
+#### Manual Startup
+
+If you prefer to start servers individually:
 
 ```bash
 # Terminal 1 - Node 1
@@ -164,6 +187,8 @@ Start a 3-node cluster:
 # Terminal 3 - Node 3
 ./bin/kvserver -id=3 -peers="localhost:10001,localhost:10002,localhost:10003" -verbose
 ```
+
+**Note:** When starting manually, you must start all 3 servers simultaneously (within ~1 second) because the Raft layer requires all peers to be reachable at startup.
 
 **Server Options:**
 - `-id` - Server ID (optional, derived from port if not specified)
@@ -257,7 +282,12 @@ distribKV/
 │   ├── grpc-test-server      # Compiled test server
 │   └── grpc-test-client      # Compiled test client
 ├── data/                     # Persistent state storage
-│   └── raft-state.json       # Raft state file
+│   ├── server1.log           # Server 1 logs
+│   ├── server2.log           # Server 2 logs
+│   └── server3.log           # Server 3 logs
+├── scripts/                  # Utility scripts
+│   ├── start-cluster.sh      # Start 3-node cluster
+│   └── test-cluster.sh       # Test cluster operations
 ├── Makefile                  # Build convenience targets
 ├── go.mod                    # Go module definition
 └── README.md                 # This file
