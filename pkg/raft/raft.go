@@ -371,8 +371,11 @@ func (r *Raft) applyCommittedEntries() {
 				CommandIndex: int(entry.Index),
 			}
 
-			// Send to apply channel (blocking)
-			r.applyCh <- msg
+			select {
+			case r.applyCh <- msg:
+			default:
+				log.Printf("[Raft %d] WARNING: applyCh full, dropping message", r.serverId)
+			}
 
 			// Update lastApplied
 			r.mu.Lock()
