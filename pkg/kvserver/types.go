@@ -71,10 +71,12 @@ type KVServer struct {
 
 type Clerk struct {
 	servers   []string
+	serverIds []int
 	leaderId  int
 	clientId  int64
 	seqNum    int64
 	mu        sync.Mutex
 	clients   map[int]*common.Client
 	kvClients map[int]pb.KVClient
+	verbose   bool
 }
