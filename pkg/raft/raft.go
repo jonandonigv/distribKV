@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jonandonigv/distribKV/pkg/common"
@@ -207,14 +208,15 @@ func (r *Raft) GetLeaderId() int {
 }
 
 // ConnectPeers establishes gRPC connections to all peers.
-// This method is blocking and will return an error if any peer fails to connect.
-// It connects to all peers concurrently for faster startup.
+// This method attempts to connect to all peers but allows some to fail initially.
+// Failed connections will be retried on-demand during operation.
 func (r *Raft) ConnectPeers(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	var wg sync.WaitGroup
-	errChan := make(chan error, len(r.peers))
+	var successCount int32
+	var failCount int32
 
 	for peerId, peer := range r.peers {
 		wg.Add(1)
@@ -229,42 +231,43 @@ func (r *Raft) ConnectPeers(ctx context.Context) error {
 			defer cancel()
 
 			if err := p.client.Connect(connectCtx); err != nil {
-				errChan <- fmt.Errorf("failed to connect to peer %d at %s: %w", id, p.address, err)
+				log.Printf("Warning: Failed to connect to peer %d at %s: %v (will retry later)", id, p.address, err)
+				atomic.AddInt32(&failCount, 1)
 				return
 			}
 
 			// Create Raft client for RPC calls
 			p.raftClient = pb.NewRaftClient(p.client.Conn())
 
-			// Verify connection by making a lightweight RPC call (RequestVote with term 0)
-			// This ensures the server is actually reachable before proceeding
+			// Verify connection by making a lightweight RPC call
 			rpcCtx, rpcCancel := context.WithTimeout(ctx, 5*time.Second)
 			defer rpcCancel()
 
 			_, err := p.raftClient.RequestVote(rpcCtx, &pb.RequestVoteRequest{
-				Term:         0, // Dummy term for connectivity check
+				Term:         0,
 				CandidateId:  int32(r.serverId),
 				LastLogIndex: 0,
 				LastLogTerm:  0,
 			})
-			// We expect this to fail or be rejected, but it confirms the server is reachable
-			// Any error other than connection errors is acceptable
+
 			if err != nil && isConnectionError(err) {
-				errChan <- fmt.Errorf("failed to reach peer %d at %s: %w", id, p.address, err)
+				log.Printf("Warning: Failed to reach peer %d at %s: %v (will retry later)", id, p.address, err)
+				atomic.AddInt32(&failCount, 1)
 				return
 			}
+
+			atomic.AddInt32(&successCount, 1)
 		}(peerId, peer)
 	}
 
-	// Wait for all connections to complete
+	// Wait for all connection attempts to complete
 	wg.Wait()
-	close(errChan)
 
-	// Check for any connection errors
-	for err := range errChan {
-		if err != nil {
-			return err
-		}
+	// Log summary
+	if failCount > 0 {
+		log.Printf("Connected to %d/%d peers (%d failed, will retry on-demand)", successCount, len(r.peers), failCount)
+	} else {
+		log.Printf("Connected to all %d peers", len(r.peers))
 	}
 
 	return nil

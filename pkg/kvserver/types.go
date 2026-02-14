@@ -57,6 +57,7 @@ type DuplicateEntry struct {
 }
 
 type KVServer struct {
+	pb.UnimplementedKVServer
 	mu            sync.Mutex
 	rf            *raft.Raft
 	applyCh       chan raft.ApplyMsg
