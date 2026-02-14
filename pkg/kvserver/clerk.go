@@ -312,3 +312,115 @@ func (ck *Clerk) tryPut(serverId int, key, value string, seqNum int64) bool {
 	}
 	return false
 }
+
+// Append appends a value to a key in the KV cluster.
+// Retries until successful or after 1000 attempts.
+// Panics if unable to complete.
+func (ck *Clerk) Append(key, value string) {
+	// Get thread-safe sequence number
+	ck.mu.Lock()
+	ck.seqNum++
+	seqNum := ck.seqNum
+	ck.mu.Unlock()
+
+	attempt := 0
+
+	for {
+		// Try cached leader first (optimization)
+		if ck.leaderId >= 0 {
+			if ok := ck.tryAppend(ck.leaderId, key, value, seqNum); ok {
+				return
+			}
+		}
+
+		// Try all servers in order by ID
+		for _, serverId := range ck.serverIds {
+			// Skip if we already tried the cached leader
+			if serverId == ck.leaderId {
+				continue
+			}
+
+			if ok := ck.tryAppend(serverId, key, value, seqNum); ok {
+				return
+			}
+		}
+
+		// All servers failed this round
+		attempt++
+
+		// Sanity check: panic after 1000 attempts
+		if attempt >= 1000 {
+			panic(fmt.Sprintf("Clerk: Append failed after 1000 attempts for key=%s", key))
+		}
+
+		// Calculate backoff and wait
+		delay := calculateBackoff(attempt)
+
+		if ck.verbose {
+			log.Printf("Clerk: Append attempt %d failed for key=%s, retrying in %v",
+				attempt, key, delay)
+		}
+
+		time.Sleep(delay)
+	}
+}
+
+// tryAppend attempts a single Append RPC to a specific server.
+// Returns true on success, false on failure.
+func (ck *Clerk) tryAppend(serverId int, key, value string, seqNum int64) bool {
+	client, ok := ck.kvClients[serverId]
+	if !ok {
+		return false
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := client.Append(ctx, &pb.AppendRequest{
+		Key:         key,
+		Value:       value,
+		ClientId:    ck.clientId,
+		SequenceNum: seqNum,
+	})
+
+	if err != nil {
+		// Network error or timeout
+		if ck.verbose {
+			log.Printf("Clerk: Append RPC error to server %d: %v", serverId, err)
+		}
+		return false
+	}
+
+	if resp.WrongLeader {
+		// Update leader hint if provided
+		ck.mu.Lock()
+		if resp.LeaderId >= 0 {
+			ck.leaderId = int(resp.LeaderId)
+			if ck.verbose {
+				log.Printf("Clerk: Learned leader is server %d", resp.LeaderId)
+			}
+		} else {
+			ck.leaderId = -1 // Unknown
+		}
+		ck.mu.Unlock()
+		return false
+	}
+
+	if resp.Success {
+		// Cache this server as leader for future requests
+		ck.mu.Lock()
+		ck.leaderId = serverId
+		ck.mu.Unlock()
+
+		if ck.verbose {
+			log.Printf("Clerk: Append succeeded on server %d", serverId)
+		}
+		return true
+	}
+
+	// Other error (shouldn't happen with current protocol)
+	if ck.verbose {
+		log.Printf("Clerk: Append failed on server %d: %s", serverId, resp.Error)
+	}
+	return false
+}
