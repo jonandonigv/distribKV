@@ -150,9 +150,11 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 	}
 
 	// Persist state before responding (Raft requirement)
+	r.mu.Unlock()
 	if err := r.persist(); err != nil {
 		return nil, fmt.Errorf("failed to persist state: %w", err)
 	}
+	r.mu.Lock()
 
 	reply.Success = true
 	return reply, nil

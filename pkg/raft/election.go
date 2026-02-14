@@ -282,9 +282,11 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 	}
 
 	// Persist state before responding (Raft requirement)
+	r.mu.Unlock()
 	if err := r.persist(); err != nil {
 		return nil, fmt.Errorf("failed to persist state: %w", err)
 	}
+	r.mu.Lock()
 
 	return reply, nil
 }
