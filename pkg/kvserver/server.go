@@ -2,6 +2,7 @@ package kvserver
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"github.com/jonandonigv/distribKV/pkg/raft"
@@ -26,6 +27,7 @@ func NewKVServer(rf *raft.Raft, maxPendingOps int) *KVServer {
 
 	// Start apply loop
 	go kv.applyLoop()
+	log.Printf("[KV] KVServer created with maxPendingOps=%d", maxPendingOps)
 
 	return kv
 }
@@ -34,6 +36,7 @@ func NewKVServer(rf *raft.Raft, maxPendingOps int) *KVServer {
 func (kv *KVServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	// Check leadership
 	if !kv.rf.IsLeader() {
+		log.Printf("[KV] Get rejected: not leader (client=%d)", req.ClientId)
 		return &pb.GetResponse{
 			Success:     false,
 			WrongLeader: true,
@@ -45,6 +48,7 @@ func (kv *KVServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 	kv.mu.Lock()
 	if dup := kv.getDuplicate(req.ClientId, req.SequenceNum); dup != nil {
 		kv.mu.Unlock()
+		log.Printf("[KV] Get cache hit: client=%d seq=%d", req.ClientId, req.SequenceNum)
 		return &pb.GetResponse{
 			Success: true,
 			Value:   dup.Result.Value,
@@ -63,12 +67,14 @@ func (kv *KVServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 	// Submit and wait
 	result, err := kv.submitOperation(op)
 	if err != nil {
+		log.Printf("[KV] Get failed for key=%s: %v", req.Key, err)
 		return &pb.GetResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, nil
 	}
 
+	log.Printf("[KV] Get success: key=%s, value=%s", req.Key, result.Value)
 	return &pb.GetResponse{
 		Success: true,
 		Value:   result.Value,
@@ -79,6 +85,7 @@ func (kv *KVServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespons
 func (kv *KVServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	// Check leadership
 	if !kv.rf.IsLeader() {
+		log.Printf("[KV] Put rejected: not leader (client=%d)", req.ClientId)
 		return &pb.PutResponse{
 			Success:     false,
 			WrongLeader: true,
@@ -90,6 +97,7 @@ func (kv *KVServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespons
 	kv.mu.Lock()
 	if dup := kv.getDuplicate(req.ClientId, req.SequenceNum); dup != nil {
 		kv.mu.Unlock()
+		log.Printf("[KV] Put cache hit: client=%d seq=%d", req.ClientId, req.SequenceNum)
 		return &pb.PutResponse{Success: true}, nil
 	}
 	kv.mu.Unlock()
@@ -106,12 +114,14 @@ func (kv *KVServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespons
 	// Submit and wait
 	_, err := kv.submitOperation(op)
 	if err != nil {
+		log.Printf("[KV] Put failed for key=%s: %v", req.Key, err)
 		return &pb.PutResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, nil
 	}
 
+	log.Printf("[KV] Put success: key=%s", req.Key)
 	return &pb.PutResponse{Success: true}, nil
 }
 
@@ -119,6 +129,7 @@ func (kv *KVServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespons
 func (kv *KVServer) Append(ctx context.Context, req *pb.AppendRequest) (*pb.AppendResponse, error) {
 	// Check leadership
 	if !kv.rf.IsLeader() {
+		log.Printf("[KV] Append rejected: not leader (client=%d)", req.ClientId)
 		return &pb.AppendResponse{
 			Success:     false,
 			WrongLeader: true,
@@ -130,6 +141,7 @@ func (kv *KVServer) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Appe
 	kv.mu.Lock()
 	if dup := kv.getDuplicate(req.ClientId, req.SequenceNum); dup != nil {
 		kv.mu.Unlock()
+		log.Printf("[KV] Append cache hit: client=%d seq=%d", req.ClientId, req.SequenceNum)
 		return &pb.AppendResponse{Success: true}, nil
 	}
 	kv.mu.Unlock()
@@ -146,12 +158,14 @@ func (kv *KVServer) Append(ctx context.Context, req *pb.AppendRequest) (*pb.Appe
 	// Submit and wait
 	_, err := kv.submitOperation(op)
 	if err != nil {
+		log.Printf("[KV] Append failed for key=%s: %v", req.Key, err)
 		return &pb.AppendResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, nil
 	}
 
+	log.Printf("[KV] Append success: key=%s", req.Key)
 	return &pb.AppendResponse{Success: true}, nil
 }
 
@@ -161,6 +175,7 @@ func (kv *KVServer) submitOperation(op Op) (Result, error) {
 	kv.mu.Lock()
 	if len(kv.pendingOps) >= kv.maxPendingOps {
 		kv.mu.Unlock()
+		log.Printf("[KV] Operation rejected: too many pending operations (%d)", len(kv.pendingOps))
 		return Result{}, ErrTooManyPending
 	}
 	kv.mu.Unlock()
@@ -202,12 +217,14 @@ func (kv *KVServer) submitOperation(op Op) (Result, error) {
 		kv.mu.Lock()
 		delete(kv.pendingOps, index)
 		kv.mu.Unlock()
+		log.Printf("[KV] Operation timeout waiting for index %d", index)
 		return Result{}, ErrTimeout
 	}
 }
 
 // Kill is used for testing to shut down the server
 func (kv *KVServer) Kill() {
+	log.Printf("[KV] KVServer shutting down")
 	kv.mu.Lock()
 	kv.dead = true
 	kv.mu.Unlock()

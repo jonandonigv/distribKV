@@ -34,6 +34,7 @@ type Peer struct {
 }
 
 type Raft struct {
+	pb.UnimplementedRaftServer
 	mu       sync.Mutex
 	peers    map[int]*Peer
 	serverId int

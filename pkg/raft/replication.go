@@ -15,6 +15,7 @@ package raft
 import (
 	"context"
 	"fmt"
+	"log"
 	"time"
 
 	pb "github.com/jonandonigv/distribKV/proto/raft"
@@ -33,11 +34,13 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 
 	// If leader's term is lower, reject
 	if req.Term < int64(r.currentTerm) {
+		log.Printf("[Raft %d] Rejected AppendEntries from leader %d: stale term %d < %d", r.serverId, req.LeaderId, req.Term, r.currentTerm)
 		return reply, nil
 	}
 
 	// If leader's term is higher, update our term and convert to follower
 	if req.Term > int64(r.currentTerm) {
+		log.Printf("[Raft %d] Received AppendEntries from leader %d with higher term %d, updating term", r.serverId, req.LeaderId, req.Term)
 		r.currentTerm = int(req.Term)
 		r.votedFor = -1
 		r.state = Follower
@@ -45,6 +48,9 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 	}
 
 	// Track the leader (valid AppendEntries with current or higher term)
+	if r.leaderId != int(req.LeaderId) {
+		log.Printf("[Raft %d] Discovered leader %d for term %d", r.serverId, req.LeaderId, req.Term)
+	}
 	r.leaderId = int(req.LeaderId)
 
 	// Reset election timer - we've received valid heartbeat/append from leader
@@ -56,17 +62,20 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		// Check if we have the entry at prevLogIndex
 		if int(req.PrevLogIndex) > len(r.log) {
 			// We don't have enough entries
+			log.Printf("[Raft %d] Log mismatch at index %d: don't have entry", r.serverId, req.PrevLogIndex)
 			return reply, nil
 		}
 		// Check if term matches at prevLogIndex (convert 1-based to 0-based array index)
 		if r.log[req.PrevLogIndex-1].Term != int(req.PrevLogTerm) {
 			// Log conflict - delete this and all following entries
+			log.Printf("[Raft %d] Log conflict at index %d: term %d != %d, truncating log", r.serverId, req.PrevLogIndex, r.log[req.PrevLogIndex-1].Term, req.PrevLogTerm)
 			r.log = r.log[:req.PrevLogIndex-1]
 			return reply, nil
 		}
 	}
 
 	// Append new entries
+	entriesAppended := 0
 	// logIndex is 1-based, so we convert to 0-based array index when accessing r.log
 	for i, entry := range req.Entries {
 		logIndex := int(req.PrevLogIndex) + i // 1-based index of where this entry should go
@@ -76,6 +85,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 			// We have an entry at this index - check for conflict
 			if r.log[arrayIndex].Term != int(entry.Term) {
 				// Conflict found - delete this and all following entries
+				log.Printf("[Raft %d] Conflict at index %d: replacing term %d with %d", r.serverId, logIndex, r.log[arrayIndex].Term, entry.Term)
 				r.log = r.log[:arrayIndex]
 				// Append the new entry
 				r.log = append(r.log, LogEntry{
@@ -83,6 +93,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 					Term:    int(entry.Term),
 					Command: entry.Command,
 				})
+				entriesAppended++
 			}
 			// If terms match, entry is already there, skip
 		} else {
@@ -92,6 +103,15 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 				Term:    int(entry.Term),
 				Command: entry.Command,
 			})
+			entriesAppended++
+		}
+	}
+
+	if len(req.Entries) > 0 {
+		if entriesAppended > 0 {
+			log.Printf("[Raft %d] Appended %d/%d entries from leader (log size: %d)", r.serverId, entriesAppended, len(req.Entries), len(r.log))
+		} else {
+			log.Printf("[Raft %d] All %d entries already present (heartbeat)", r.serverId, len(req.Entries))
 		}
 	}
 
@@ -99,6 +119,7 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 	// Note: logIndex is 1-based, commitIndex should also be 1-based
 	// SAFETY: Raft never commits log entries from previous terms by counting replicas.
 	// We only advance commitIndex if the entry at that index is from the current term.
+	oldCommitIndex := r.commitIndex
 	if req.LeaderCommit > int64(r.commitIndex) {
 		lastNewIndex := req.PrevLogIndex + int64(len(req.Entries)) // 1-based
 		newCommitIndex := req.LeaderCommit
@@ -121,6 +142,10 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 				break
 			}
 			r.commitIndex = i
+		}
+
+		if r.commitIndex > oldCommitIndex {
+			log.Printf("[Raft %d] Advanced commitIndex: %d -> %d", r.serverId, oldCommitIndex, r.commitIndex)
 		}
 	}
 
@@ -146,6 +171,7 @@ func (r *Raft) ReplicateCommand(cmd []byte) (int, error) {
 	r.mu.Lock()
 	if r.state != Leader {
 		r.mu.Unlock()
+		log.Printf("[Raft %d] ReplicateCommand rejected: not leader", r.serverId)
 		return 0, ErrNotLeader
 	}
 
@@ -159,6 +185,7 @@ func (r *Raft) ReplicateCommand(cmd []byte) (int, error) {
 		Command: cmd,
 	}
 	r.log = append(r.log, entry)
+	log.Printf("[Raft %d] Appended command to log at index %d (term %d)", r.serverId, nextIndex, r.currentTerm)
 
 	// Persist immediately (critical for durability)
 	if err := r.persist(); err != nil {
@@ -176,6 +203,7 @@ func (r *Raft) ReplicateCommand(cmd []byte) (int, error) {
 	r.mu.Unlock()
 
 	// Wait for commit with timeout (5 seconds)
+	log.Printf("[Raft %d] Waiting for command %d to commit...", r.serverId, targetIndex)
 	timeout := time.After(5 * time.Second)
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -183,12 +211,14 @@ func (r *Raft) ReplicateCommand(cmd []byte) (int, error) {
 	for {
 		select {
 		case <-timeout:
+			log.Printf("[Raft %d] Timeout waiting for commit of index %d", r.serverId, targetIndex)
 			return targetIndex, ErrTimeout
 		case <-ticker.C:
 			r.mu.Lock()
 			committed := r.commitIndex >= targetIndex
 			r.mu.Unlock()
 			if committed {
+				log.Printf("[Raft %d] Command %d committed successfully", r.serverId, targetIndex)
 				return targetIndex, nil
 			}
 		}
@@ -251,6 +281,7 @@ func (r *Raft) sendAppendEntries(peerId int) {
 	reply, err := peer.raftClient.AppendEntries(ctx, args)
 	if err != nil {
 		// RPC failed - will retry on next heartbeat
+		log.Printf("[Raft %d] AppendEntries RPC to peer %d failed: %v", r.serverId, peerId, err)
 		return
 	}
 
@@ -265,6 +296,7 @@ func (r *Raft) sendAppendEntries(peerId int) {
 
 	// Check for higher term
 	if reply.Term > int64(r.currentTerm) {
+		log.Printf("[Raft %d] Peer %d has higher term %d, stepping down", r.serverId, peerId, reply.Term)
 		r.stepDown(int(reply.Term))
 		return
 	}
@@ -274,6 +306,7 @@ func (r *Raft) sendAppendEntries(peerId int) {
 		newMatchIndex := prevLogIndex + len(entries)
 		if newMatchIndex > peer.matchIndex {
 			peer.matchIndex = newMatchIndex
+			log.Printf("[Raft %d] Peer %d replicated up to index %d", r.serverId, peerId, peer.matchIndex)
 		}
 		peer.nextIndex = peer.matchIndex + 1
 
@@ -281,6 +314,7 @@ func (r *Raft) sendAppendEntries(peerId int) {
 		r.updateCommitIndex()
 	} else {
 		// Log mismatch - decrement nextIndex and retry
+		log.Printf("[Raft %d] Peer %d rejected AppendEntries (log mismatch), retrying with nextIndex=%d", r.serverId, peerId, peer.nextIndex-1)
 		if peer.nextIndex > 1 {
 			peer.nextIndex--
 		}
@@ -295,6 +329,8 @@ func (r *Raft) updateCommitIndex() {
 	if r.state != Leader {
 		return
 	}
+
+	oldCommitIndex := r.commitIndex
 
 	// Find highest N where a majority has matchIndex >= N
 	for n := r.commitIndex + 1; n <= len(r.log); n++ {
@@ -320,5 +356,9 @@ func (r *Raft) updateCommitIndex() {
 			// No majority for this entry or higher
 			break
 		}
+	}
+
+	if r.commitIndex > oldCommitIndex {
+		log.Printf("[Raft %d] Leader advanced commitIndex: %d -> %d (majority achieved)", r.serverId, oldCommitIndex, r.commitIndex)
 	}
 }

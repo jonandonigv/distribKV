@@ -2,6 +2,7 @@ package kvserver
 
 import (
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/jonandonigv/distribKV/pkg/raft"
@@ -16,12 +17,15 @@ const (
 
 // applyLoop runs as a background goroutine, processing committed Raft commands
 func (kv *KVServer) applyLoop() {
+	log.Printf("[KV] Apply loop started")
 	for {
 		select {
 		case msg := <-kv.applyCh:
 			kv.processApplyMsg(msg)
 		case <-kv.shutdownCh:
+			log.Printf("[KV] Apply loop shutting down")
 			kv.drainApplyCh()
+			log.Printf("[KV] Apply loop stopped")
 			return
 		}
 	}
@@ -42,12 +46,14 @@ func (kv *KVServer) processApplyMsg(msg raft.ApplyMsg) {
 	// Check if this is a duplicate operation
 	if dup := kv.getDuplicate(cmd.ClientId, cmd.SequenceId); dup != nil {
 		// Already applied, notify waiter if pending
+		log.Printf("[KV] Duplicate request detected: client=%d seq=%d, using cached result", cmd.ClientId, cmd.SequenceId)
 		kv.notifyWaiter(msg.CommandIndex, dup.Result)
 		return
 	}
 
 	// Apply command to state machine
 	result := kv.applyCommand(cmd)
+	log.Printf("[KV] Applied %s operation (index %d): key=%s", cmd.Type, msg.CommandIndex, cmd.Key)
 
 	// Save result to duplicate cache
 	kv.saveDuplicate(cmd.ClientId, cmd.SequenceId, result)

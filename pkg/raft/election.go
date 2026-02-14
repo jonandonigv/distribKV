@@ -3,6 +3,7 @@ package raft
 import (
 	"context"
 	"fmt"
+	"log"
 	"math/rand"
 	"time"
 
@@ -29,6 +30,7 @@ func (r *Raft) runElectionTimer() {
 		select {
 		case <-timer.C:
 			// Timer expired - start new election
+			log.Printf("[Raft %d] Election timeout fired (no heartbeat), starting election", r.serverId)
 			r.becomeCandidate()
 
 		case <-r.electionResetChan:
@@ -62,11 +64,14 @@ func (r *Raft) becomeCandidate() {
 		return
 	}
 
+	oldState := r.state
 	// Increment term and vote for self
 	r.currentTerm++
 	r.votedFor = r.serverId
 	r.state = Candidate
 	r.leaderId = -1 // Starting election - clear leader knowledge
+
+	log.Printf("[Raft %d] State change: %v -> Candidate (term %d)", r.serverId, oldState, r.currentTerm)
 
 	// Reset vote count (self-vote = 1)
 	r.votesMutex.Lock()
@@ -79,6 +84,8 @@ func (r *Raft) becomeCandidate() {
 
 	// Reset election timer for this term (self-vote resets timer)
 	r.resetElectionTimer()
+
+	log.Printf("[Raft %d] Sending RequestVote to %d peers (term %d)", r.serverId, len(r.peers), term)
 
 	// Send RequestVote to all peers concurrently
 	for peerId := range r.peers {
@@ -115,6 +122,7 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 	reply, err := peer.raftClient.RequestVote(ctx, args)
 	if err != nil {
 		// RPC failed - don't count this as a rejection
+		log.Printf("[Raft %d] RequestVote RPC to peer %d failed: %v", r.serverId, peerId, err)
 		return
 	}
 
@@ -124,11 +132,13 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 
 	// Check if term changed while we were waiting (election already finished)
 	if r.currentTerm != term {
+		log.Printf("[Raft %d] Election already finished (term changed), ignoring vote from %d", r.serverId, peerId)
 		return
 	}
 
 	// Check for higher term
 	if reply.Term > int64(r.currentTerm) {
+		log.Printf("[Raft %d] Received higher term %d from peer %d, stepping down", r.serverId, reply.Term, peerId)
 		r.stepDown(int(reply.Term))
 		return
 	}
@@ -140,6 +150,8 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		votes := r.votesReceived
 		r.votesMutex.Unlock()
 
+		log.Printf("[Raft %d] Received vote from peer %d (total: %d/%d)", r.serverId, peerId, votes, len(r.peers)/2+1)
+
 		// Check if we have majority and are still a candidate
 		// Must hold r.mu when reading r.state to avoid race condition
 		r.mu.Lock()
@@ -149,16 +161,20 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		if votes > len(r.peers)/2 && isCandidate {
 			r.becomeLeader()
 		}
+	} else {
+		log.Printf("[Raft %d] Peer %d rejected vote request", r.serverId, peerId)
 	}
 }
 
 // stepDown transitions the node to follower state with the given term.
 // It updates the term, resets votedFor, and resets the election timer.
 func (r *Raft) stepDown(newTerm int) {
+	oldState := r.state
 	r.currentTerm = newTerm
 	r.votedFor = -1
 	r.state = Follower
 	r.leaderId = -1 // Clear leader knowledge when stepping down
+	log.Printf("[Raft %d] State change: %v -> Follower (term %d)", r.serverId, oldState, newTerm)
 	r.resetElectionTimer()
 }
 
@@ -194,6 +210,7 @@ func (r *Raft) becomeLeader() {
 		return
 	}
 
+	log.Printf("[Raft %d] *** ELECTED LEADER (term %d) ***", r.serverId, r.currentTerm)
 	r.state = Leader
 	r.leaderId = r.serverId // Self-aware: track self as leader
 
@@ -228,6 +245,7 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 
 	// If candidate's term is higher, update our term and reset votedFor
 	if req.Term > int64(r.currentTerm) {
+		log.Printf("[Raft %d] Received RequestVote from candidate %d with higher term %d, updating term", r.serverId, req.CandidateId, req.Term)
 		r.currentTerm = int(req.Term)
 		r.votedFor = -1
 		r.state = Follower
@@ -253,7 +271,14 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 			(req.LastLogTerm == int64(lastLogTerm) && req.LastLogIndex >= int64(lastLogIndex)) {
 			r.votedFor = int(req.CandidateId)
 			reply.VoteGranted = true
+			log.Printf("[Raft %d] Granted vote to candidate %d for term %d", r.serverId, req.CandidateId, req.Term)
+		} else {
+			log.Printf("[Raft %d] Denied vote to candidate %d: log not up-to-date (candidate: %d@%d, me: %d@%d)",
+				r.serverId, req.CandidateId, req.LastLogIndex, req.LastLogTerm, lastLogIndex, lastLogTerm)
 		}
+	} else {
+		log.Printf("[Raft %d] Denied vote to candidate %d: already voted for %d in term %d",
+			r.serverId, req.CandidateId, r.votedFor, r.currentTerm)
 	}
 
 	// Persist state before responding (Raft requirement)
@@ -285,6 +310,7 @@ func (r *Raft) stopHeartbeat() {
 // runHeartbeat is the background goroutine that sends periodic heartbeats to all peers.
 // It runs until stopHeartbeat is called.
 func (r *Raft) runHeartbeat() {
+	log.Printf("[Raft %d] Heartbeat sender started (interval: %v)", r.serverId, r.heartbeatInterval)
 	ticker := time.NewTicker(r.heartbeatInterval)
 	defer ticker.Stop()
 
@@ -294,6 +320,7 @@ func (r *Raft) runHeartbeat() {
 			// Send heartbeat to all peers
 			r.mu.Lock()
 			if r.state != Leader {
+				log.Printf("[Raft %d] Heartbeat sender stopping: no longer leader", r.serverId)
 				r.mu.Unlock()
 				return
 			}
@@ -304,6 +331,7 @@ func (r *Raft) runHeartbeat() {
 			}
 
 		case <-r.heartbeatStopChan:
+			log.Printf("[Raft %d] Heartbeat sender stopped", r.serverId)
 			return
 		}
 	}
