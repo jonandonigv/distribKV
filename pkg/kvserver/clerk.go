@@ -1,47 +1,62 @@
 package kvserver
 
-// TODO: Implement client library (clerk) for KV service
-//
-// Purpose: Client-side library for interacting with KV cluster
-//
-// Key Features:
-//
-// 1. Clerk Struct:
-//    type Clerk struct {
-//        servers   []string    // List of all server addresses
-//        leaderId  int         // Cached leader hint
-//        clientId  int64       // Unique client ID
-//        seqNum    int64       // Monotonically increasing sequence number
-//    }
-//
-// 2. Connection Management:
-//    - Maintain connections to all servers
-//    - Cache leader information
-//    - Reconnect on failure
-//
-// 3. Request Methods:
-//    - Get(key string) string
-//    - Put(key string, value string)
-//    - Append(key string, value string)
-//
-// 4. Retry Logic:
-//    - On timeout: retry with same sequence number
-//    - On wrong leader: update leader hint, retry
-//    - Exponential backoff for failures
-//    - At-least-once semantics (duplicates handled by server)
-//
-// 5. Sequence Numbers:
-//    - Each operation gets unique (clientId, seqNum) pair
-//    - Server detects duplicates and returns cached result
-//    - Enables exactly-once semantics from client perspective
-//
-// 6. Leader Discovery:
-//    - Try cached leader first
-//    - On wrong leader error: try other servers
-//    - Update leader cache on success
-//
-// Example Usage:
-//    ck := kvserver.MakeClerk([]string{"localhost:10001", "localhost:10002", "localhost:10003"})
-//    ck.Put("foo", "bar")
-//    value := ck.Get("foo") // "bar"
-//    ck.Append("foo", "-baz") // "bar-baz"
+import (
+	"context"
+	"log"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/jonandonigv/distribKV/pkg/common"
+	pb "github.com/jonandonigv/distribKV/proto/kv"
+)
+
+// MakeClerk creates a new Clerk instance connected to all servers
+func MakeClerk(servers []string) *Clerk {
+	ck := &Clerk{
+		servers:   servers,
+		leaderId:  -1,
+		clientId:  time.Now().UnixNano(),
+		seqNum:    0,
+		clients:   make(map[int]*common.Client),
+		kvClients: make(map[int]pb.KVClient),
+	}
+
+	// Connect to all servers
+	for _, addr := range ck.servers {
+		serverId := deriveIdFromAddress(addr)
+
+		client := common.NewClient(addr)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := client.Connect(ctx)
+		cancel()
+
+		if err != nil {
+			log.Printf("Clerk: failed to connect to %s: %v", addr, err)
+			continue
+		}
+
+		ck.clients[serverId] = client
+		ck.kvClients[serverId] = pb.NewKVClient(client.Conn())
+	}
+
+	if len(ck.clients) == 0 {
+		panic("Clerk: failed to connect to any server")
+	}
+
+	return ck
+}
+
+// deriveIdFromAddress extracts server ID from address (port %% 10000)
+func deriveIdFromAddress(address string) int {
+	parts := strings.Split(address, ":")
+	if len(parts) != 2 {
+		return 0
+	}
+	port, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return 0
+	}
+	return port % 10000
+}

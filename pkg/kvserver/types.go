@@ -5,9 +5,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jonandonigv/distribKV/pkg/common"
 	"github.com/jonandonigv/distribKV/pkg/raft"
 	pb "github.com/jonandonigv/distribKV/proto/kv"
-	"google.golang.org/grpc"
 )
 
 var (
@@ -70,11 +70,11 @@ type KVServer struct {
 }
 
 type Clerk struct {
-	servers  []string
-	leaderId int
-	clientId int64
-	seqNum   int64
-	mu       sync.Mutex
-	conns    map[int]*grpc.ClientConn
-	clients  map[int]pb.KVClient
+	servers   []string
+	leaderId  int
+	clientId  int64
+	seqNum    int64
+	mu        sync.Mutex
+	clients   map[int]*common.Client
+	kvClients map[int]pb.KVClient
 }
