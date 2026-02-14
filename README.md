@@ -11,20 +11,20 @@ distribKV provides a fault-tolerant, strongly consistent key-value store through
 - ✅ Strong consistency (linearizable reads/writes)
 - ✅ Fault tolerance with automatic leader election
 - ✅ Crash recovery with state persistence
+- ✅ Key-Value service layer (Put/Get/Append)
+- ✅ Client library with automatic retry and leader discovery
+- ✅ gRPC-based communication
 - 🔄 Log compaction via snapshotting (planned)
-- 🔄 Key-Value service layer (planned)
 
 ## Current Implementation Status
 
-### ✅ Completed (Core Raft)
+### ✅ Completed
 
-**Leader Election**
+**Core Raft**
 - Randomized timeouts (150-300ms)
 - Vote counting with proper mutex protection
 - Timer reset on valid leader communication
 - Election safety: only one leader per term
-
-**Log Replication**
 - Heartbeat sender (50ms intervals)
 - AppendEntries RPC with log matching
 - Conflict detection and log truncation
@@ -42,19 +42,61 @@ distribKV provides a fault-tolerant, strongly consistent key-value store through
 - Background apply goroutine
 - Proper lastApplied tracking
 
-### 🔄 In Progress / Planned
+**Key-Value Service**
+- Get, Put, Append operations
+- Duplicate detection and caching (100 entries or 10s per client)
+- Leader tracking and hints
+- Thread-safe concurrent operations
+- 5-second RPC timeout with retry
 
-**Client Interface**
-- `ReplicateCommand()` API implemented
-- KV service integration pending
+**Client Library (Clerk)**
+- Automatic leader discovery
+- Exponential backoff retry (50ms → 1s)
+- Sequence numbers for exactly-once semantics
+- Persistent connections to all servers
+- 1000 attempt limit with panic on total failure
+
+### 🔄 In Progress / Planned
 
 **Future Work**
 - Log compaction and snapshotting
-- KV service layer (Put/Get/Append)
-- Production server binary
 - Comprehensive test suite
+- Production deployment hardening
 
 ## Architecture
+
+### Two-Layer Design
+
+```
+┌─────────────────────────────────────────┐
+│         APPLICATION LAYER               │
+│                                         │
+│   ck.Get("foo")                         │
+│   ck.Put("bar", "baz")                  │
+│   ck.Append("key", "-suffix")           │
+│                                         │
+└──────────────┬──────────────────────────┘
+               │
+┌──────────────▼──────────────────────────┐
+│              CLERK                      │
+│                                         │
+│  • Leader caching & discovery           │
+│  • Automatic retry with backoff         │
+│  • Sequence number tracking             │
+│  • Connection management                │
+│                                         │
+└──────────────┬──────────────────────────┘
+               │ gRPC
+┌──────────────▼──────────────────────────┐
+│            KV CLUSTER                   │
+│                                         │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐ │
+│  │Server 1 │  │Server 2 │  │Server 3 │ │
+│  │ (Raft)  │  │ (Raft)  │  │ (Raft)  │ │
+│  └─────────┘  └─────────┘  └─────────┘ │
+│                                         │
+└─────────────────────────────────────────┘
+```
 
 ### Consensus & Raft
 
@@ -101,15 +143,63 @@ go mod tidy
 ### Build
 
 ```bash
-# Using make (recommended)
-make build
-
-# Or build individual components
-make server  # Build grpc-test-server
-make client  # Build grpc-test-client
+# Build the KV server
+go build -o bin/kvserver ./cmd/kvserver
 
 # Build all binaries
 go build -o bin/ ./cmd/...
+```
+
+### Running a Cluster
+
+Start a 3-node cluster:
+
+```bash
+# Terminal 1 - Node 1
+./bin/kvserver -id=1 -peers="localhost:10001,localhost:10002,localhost:10003" -verbose
+
+# Terminal 2 - Node 2
+./bin/kvserver -id=2 -peers="localhost:10001,localhost:10002,localhost:10003" -verbose
+
+# Terminal 3 - Node 3
+./bin/kvserver -id=3 -peers="localhost:10001,localhost:10002,localhost:10003" -verbose
+```
+
+**Server Options:**
+- `-id` - Server ID (optional, derived from port if not specified)
+- `-peers` - Comma-separated list of peer addresses (required)
+- `-port` - Port to listen on (default: 10000 + id)
+- `-verbose` - Enable verbose logging
+- `-data` - Data directory for persistence (default: ./data)
+
+### Using the Client Library
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/jonandonigv/distribKV/pkg/kvserver"
+)
+
+func main() {
+    // Create clerk (client)
+    ck := kvserver.MakeClerk([]string{
+        "localhost:10001",
+        "localhost:10002",
+        "localhost:10003",
+    }, false) // verbose=false
+
+    // Store a value
+    ck.Put("greeting", "Hello")
+    
+    // Append to it
+    ck.Append("greeting", " World")
+    
+    // Retrieve the value
+    value := ck.Get("greeting")
+    fmt.Println(value) // Output: Hello World
+}
 ```
 
 ### Running Tests
@@ -125,129 +215,100 @@ go test ./pkg/raft -run TestElection -v
 go test -race -cover ./...
 ```
 
-### Testing gRPC Infrastructure
-
-The project includes CLI tools to test the gRPC communication layer using a standard Health Check service.
-
-#### Start Server
-
-```bash
-# Start on default port (50051)
-./bin/grpc-test-server
-
-# Start on custom port with custom ID
-./bin/grpc-test-server --port=10001 --id=server-1
-```
-
-Server options:
-- `--port` - Server port (default: 50051)
-- `--id` - Server identifier for logging (default: "1")
-
-#### Run Client
-
-**Single Request Mode (default):**
-
-```bash
-./bin/grpc-test-client --addr=localhost:50051 --id=client-1
-```
-
-Single mode performs one health check and exits with status 0 on success, 1 on failure.
-
-**Continuous Request Mode:**
-
-```bash
-# Send 10 requests with 500ms delay between requests
-./bin/grpc-test-client --addr=localhost:50051 --mode=continuous --requests=10 --delay=500ms --id=load-test-1
-```
-
-Continuous mode options:
-- `--mode` - "single" or "continuous" (default: single)
-- `--requests` - Number of requests to send (continuous mode, default: 1)
-- `--delay` - Delay between requests (continuous mode, default: 1s)
-- `--addr` - Server address (default: localhost:50051)
-- `--id` - Client identifier for logging (default: "client")
-
-#### Multi-Client Testing
-
-Test concurrent client connections:
-
-```bash
-# Terminal 1: Start server
-./bin/grpc-test-server --port=50051 --id=server
-
-# Terminal 2: Start client 1
-./bin/grpc-test-client --id=client-1 --mode=continuous --requests=100 --delay=200ms &
-
-# Terminal 3: Start client 2
-./bin/grpc-test-client --id=client-2 --mode=continuous --requests=100 --delay=300ms &
-
-# Terminal 4: Start client 3
-./bin/grpc-test-client --id=client-3 --mode=continuous --requests=100 --delay=400ms &
-```
-
-Each client logs its own statistics including success rate and average latency.
-
-#### Graceful Shutdown
-
-Both server and client respond to `SIGINT` (Ctrl+C) and `SIGTERM` signals gracefully.
-
-```bash
-# Server logs shutdown sequence
-[test-server] 2026/01/22 12:32:49 Health check server listening on port 50051
-^C[test-server] 2026/01/22 12:32:52 Shutting down server...
-[test-server] 2026/01/22 12:32:52 Server stopped gracefully
-```
-
-Client in continuous mode reports statistics before shutting down.
-
 ## Project Structure
 
 ```
 distribKV/
 ├── cmd/
-│   ├── grpc-test-server/   # gRPC Health Check server (testing)
+│   ├── kvserver/             # Main KV server binary
 │   │   └── main.go
-│   ├── grpc-test-client/   # gRPC Health Check client (testing)
+│   ├── grpc-test-server/     # gRPC Health Check server (testing)
 │   │   └── main.go
-│   └── raft-kv-server/    # Main KV server (planned)
+│   └── grpc-test-client/     # gRPC Health Check client (testing)
+│       └── main.go
 ├── pkg/
 │   ├── common/
-│   │   └── grpc.go        # gRPC server/client utilities
+│   │   └── grpc.go           # gRPC server/client utilities
 │   ├── health/
-│   │   └── health.go      # Health Check service implementation
-│   ├── raft/              # ✅ Core Raft implementation (COMPLETE)
-│   │   ├── raft.go        # Main Raft struct and initialization
-│   │   ├── election.go    # Leader election and timers
-│   │   ├── replication.go # Log replication and heartbeat
-│   │   └── persistence.go # State persistence to disk
-│   └── kvserver/          # 🔄 KV service (NOT IMPLEMENTED)
-│       ├── server.go      # TODO: KV service on Raft
-│       └── clerk.go       # TODO: Client library
+│   │   └── health.go         # Health Check service implementation
+│   ├── raft/                 # Core Raft implementation
+│   │   ├── raft.go           # Main Raft struct and initialization
+│   │   ├── election.go       # Leader election and timers
+│   │   ├── replication.go    # Log replication and heartbeat
+│   │   └── persistance.go    # State persistence to disk
+│   ├── kvserver/             # KV service implementation
+│   │   ├── server.go         # KVServer with RPC handlers
+│   │   ├── clerk.go          # Client library
+│   │   ├── apply.go          # Apply loop for state machine
+│   │   └── types.go          # Type definitions
+│   └── snapshot/             # Snapshotting utilities
+│       └── snapshot.go
 ├── proto/
-│   ├── raft.proto         # Raft RPC definitions
-│   ├── raft.pb.go         # Generated messages
-│   ├── raft_grpc.pb.go    # Generated service interfaces
-│   ├── health.proto       # Health Check service definition
-│   └── health_grpc.pb.go  # Generated service interfaces
+│   ├── kv.proto              # KV service definitions
+│   ├── kv.pb.go              # Generated KV messages
+│   ├── kv_grpc.pb.go         # Generated KV service interfaces
+│   ├── raft.proto            # Raft RPC definitions
+│   ├── raft/
+│   │   ├── raft.pb.go        # Generated Raft messages
+│   │   └── raft_grpc.pb.go   # Generated Raft service interfaces
+│   └── health.proto          # Health Check service definition
 ├── bin/
-│   ├── grpc-test-server   # Compiled test server
-│   ├── grpc-test-client   # Compiled test client
-│   └── test-connect       # Raft connection test tool
-├── data/                  # Persistent state storage
-│   └── raft-state.json    # Raft state file
-├── Makefile               # Build convenience targets
-├── configs/
-│   └── cluster.yaml       # Cluster configuration
-└── scripts/
-    ├── start-cluster.sh   # Start multi-node cluster (planned)
-    └── test-cluster.sh    # Run tests (planned)
+│   ├── kvserver              # Compiled KV server
+│   ├── grpc-test-server      # Compiled test server
+│   └── grpc-test-client      # Compiled test client
+├── data/                     # Persistent state storage
+│   └── raft-state.json       # Raft state file
+├── Makefile                  # Build convenience targets
+├── go.mod                    # Go module definition
+└── README.md                 # This file
 ```
 
 ## API Reference
 
+### Client Library (Clerk)
+
+The Clerk provides a simple API for interacting with the KV cluster:
+
+#### Creating a Clerk
+
+```go
+import "github.com/jonandonigv/distribKV/pkg/kvserver"
+
+// Create clerk connected to all servers
+ck := kvserver.MakeClerk([]string{
+    "localhost:10001",
+    "localhost:10002", 
+    "localhost:10003",
+}, false) // verbose=false for production
+```
+
+#### Put Operation
+
+```go
+// Store a key-value pair
+// Panics if operation fails after 1000 attempts
+ck.Put("mykey", "myvalue")
+```
+
+#### Get Operation
+
+```go
+// Retrieve a value
+// Returns value or panics on failure
+value := ck.Get("mykey")
+```
+
+#### Append Operation
+
+```go
+// Append value to existing key
+// Equivalent to: value = value + suffix
+ck.Append("mykey", "-suffix")
+```
+
 ### Core Raft API
 
-The Raft consensus layer is implemented in `pkg/raft/` and provides the following public API:
+For advanced use cases, you can interact with the Raft layer directly:
 
 #### Creating a Raft Node
 
@@ -271,51 +332,36 @@ if err != nil {
     log.Fatal(err)
 }
 
-// Start the election timer (must be called explicitly)
+// Start the election timer
 r.Start()
 ```
 
-#### Submitting Commands (ReplicateCommand)
+#### Submitting Commands
 
 ```go
 // Submit a command to the Raft log
-// Only the leader accepts commands
 command := []byte("your-command-data")
 index, err := r.ReplicateCommand(command)
 
 if err == raft.ErrNotLeader {
     // This node is not the leader
-    // The client should retry with another node
     log.Println("Not leader, retry with another node")
     return
 }
 
 if err == raft.ErrTimeout {
     // Timeout waiting for commit (5 seconds)
-    // The command may still commit later via heartbeat
-    // The index is returned so you can poll for status
     log.Printf("Timeout, but command may still commit at index %d", index)
     return
 }
 
 if err != nil {
-    // Other error (persistence failure, etc.)
     log.Printf("Error: %v", err)
     return
 }
 
-// Success! Command committed at index
 log.Printf("Command committed at index %d", index)
 ```
-
-**ReplicateCommand Details:**
-
-- **Blocking call** - Waits until committed or timeout
-- **5-second timeout** - Returns `ErrTimeout` if not committed in time
-- **Leader check** - Returns `ErrNotLeader` immediately if not leader
-- **Returns index** - Even on timeout, returns the log index for polling
-- **Automatic persistence** - State persisted before returning
-- **Immediate replication** - Triggers AppendEntries to all peers
 
 #### Receiving Applied Commands
 
@@ -326,88 +372,71 @@ applyCh := r.GetApplyCh()
 // Read committed commands
 for msg := range applyCh {
     if msg.CommandValid {
-        // Apply the command to your state machine
         fmt.Printf("Applying command at index %d: %v\n", 
             msg.CommandIndex, msg.Command)
-        
-        // Your application logic here
-        // e.g., update key-value store
     }
 }
 ```
 
-**ApplyMsg Structure:**
+## Implementation Details
 
-```go
-type ApplyMsg struct {
-    CommandValid bool   // True if command is valid
-    Command      []byte // The command data
-    CommandIndex int    // Log index where command is stored
-}
-```
+### Duplicate Detection
 
-#### Testing Utilities
+The KV server tracks completed operations using (clientId, sequenceNum) pairs:
+- Cache size: 100 entries per client
+- Expiration: 10 seconds
+- Eviction: FIFO when limit reached
 
-```go
-// Use deterministic timeout for testing (100ms instead of 150-300ms)
-r.SetDeterministicTimeout(100 * time.Millisecond)
-```
+This ensures exactly-once semantics even with client retries.
 
-### Future: Key-Value Service (NOT YET IMPLEMENTED)
+### Leader Discovery
 
-The KV service layer will be built on top of the Raft consensus layer:
+The Clerk maintains a leader cache:
+- Tries cached leader first for optimization
+- Updates cache on wrong_leader responses
+- Falls back to round-robin if leader unknown
+- Clears cache on election timeout
 
-```go
-// Planned API (not yet implemented)
-clerk := kvserver.NewClerk([]string{
-    "localhost:10001", 
-    "localhost:10002", 
-    "localhost:10003",
-})
+### Retry Strategy
 
-// Put operation
-clerk.Put("foo", "bar")
+All operations use exponential backoff:
+- Attempt 1: 50ms
+- Attempt 2: 100ms
+- Attempt 3: 200ms
+- Attempt 4: 400ms
+- Attempt 5: 800ms
+- Attempt 6+: 1s (capped)
 
-// Get operation  
-value := clerk.Get("foo") // returns "bar"
+Maximum 1000 attempts before panic (indicates total cluster failure).
 
-// Append operation
-clerk.Append("foo", "-baz")
-```
+### Thread Safety
+
+The Clerk is safe for concurrent use:
+- Sequence numbers use mutex protection
+- Leader cache updates are atomic
+- Multiple goroutines can share one Clerk instance
 
 ## Learning Phases
 
 ### ✅ Completed
 
 1. **Phase 1**: Raft Foundation - Leader election and heartbeats
-   - Randomized election timeouts (150-300ms)
-   - Vote counting with proper safety
-   - Timer reset on valid leader communication
-
 2. **Phase 2**: Log Replication - Replicate client commands across cluster
-   - Heartbeat sender (50ms intervals)
-   - AppendEntries RPC with log matching
-   - Conflict detection and resolution
-   - Automatic retry on mismatch
-
 3. **Phase 3**: Persistence - Crash recovery using persistent storage
-   - JSON format with base64 encoding
-   - Atomic writes (temp file + fsync + rename)
-   - Automatic state recovery on startup
+4. **Phase 4**: Key-Value Service - Build KV store on top of Raft
 
 ### 🔄 Current / Next
-
-4. **Phase 4**: Key-Value Service - Build KV store on top of Raft
-   - ✅ `ReplicateCommand()` API implemented
-   - 🔄 KV server integration pending
-   - 🔄 Client library (Clerk) pending
-
-### 📋 Planned
 
 5. **Phase 5**: Snapshotting - Log compaction and faster recovery
    - InstallSnapshot RPC
    - Log truncation
    - State machine snapshots
+
+6. **Phase 6**: Production Hardening
+   - Comprehensive test suite
+   - Metrics and monitoring
+   - Configuration management
+   - Deployment tooling
 
 ## Resources
 
@@ -424,9 +453,9 @@ clerk.Append("foo", "-baz")
 
 This project is being developed with production deployment as a goal. Follow the guidelines in [AGENTS.md](./AGENTS.md) for code style and testing.
 
-When making changes to gRPC infrastructure:
-1. Test with `grpc-test-server` and `grpc-test-client` CLI tools
-2. Verify multi-client scenarios work correctly
+When making changes:
+1. Test with the KV server and Clerk
+2. Verify multi-node scenarios work correctly
 3. Ensure graceful shutdown on signals
 4. Run tests with race detector: `go test -race ./...`
 
