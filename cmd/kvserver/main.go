@@ -15,6 +15,7 @@ import (
 	"github.com/jonandonigv/distribKV/pkg/kvserver"
 	"github.com/jonandonigv/distribKV/pkg/raft"
 	pb "github.com/jonandonigv/distribKV/proto/kv"
+	raftpb "github.com/jonandonigv/distribKV/proto/raft"
 )
 
 func main() {
@@ -73,8 +74,11 @@ func main() {
 		log.Fatalf("Failed to start gRPC server: %v", err)
 	}
 
-	// Register KV service
+	// Register KV service (for clients)
 	grpcServer.RegisterService(&pb.KV_ServiceDesc, kv)
+
+	// Register Raft service (for peer-to-peer consensus)
+	grpcServer.RegisterService(&raftpb.Raft_ServiceDesc, rf)
 
 	// Start Raft election process
 	rf.Start()
