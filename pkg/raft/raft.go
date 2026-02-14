@@ -47,6 +47,7 @@ type Raft struct {
 	state       State
 	commitIndex int
 	lastApplied int
+	leaderId    int // Current leader ID (-1 if unknown, own ID if leader)
 
 	// Election timer (goroutine + select approach)
 	electionResetChan       chan struct{}
@@ -116,6 +117,7 @@ func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (
 		state:                   Follower,
 		commitIndex:             0,
 		lastApplied:             0,
+		leaderId:                -1, // Unknown on startup
 		log:                     make([]LogEntry, 0),
 		electionTimeoutMin:      150 * time.Millisecond,
 		electionTimeoutMax:      300 * time.Millisecond,
@@ -183,6 +185,25 @@ func (r *Raft) GetServerId() int {
 
 func (r *Raft) GetAddress() string {
 	return r.address
+}
+
+// IsLeader returns true if this node is the current leader.
+func (r *Raft) IsLeader() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.state == Leader
+}
+
+// GetLeaderId returns the current leader's ID.
+// Returns own ID if this node is leader, -1 if unknown.
+func (r *Raft) GetLeaderId() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.state == Leader {
+		return r.serverId
+	}
+	return r.leaderId
 }
 
 // ConnectPeers establishes gRPC connections to all peers.

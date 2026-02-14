@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package kv;
+
+option go_package = "github.com/jonandonigv/distribKV/proto/kv";
+
+service KV {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Append(AppendRequest) returns (AppendResponse);
+}
+
+enum OpType {
+  OP_TYPE_UNSPECIFIED = 0;
+  OP_TYPE_GET = 1;
+  OP_TYPE_PUT = 2;
+  OP_TYPE_APPEND = 3;
+}
+
+// Command is serialized and stored in Raft log
+message Command {
+  OpType op = 1;
+  string key = 2;
+  string value = 3;
+  int64 client_id = 4;
+  int64 sequence_num = 5;
+}
+
+message GetRequest {
+  string key = 1;
+  int64 client_id = 2;
+  int64 sequence_num = 3;
+}
+
+message GetResponse {
+  bool success = 1;
+  string value = 2;
+  bool wrong_leader = 3;
+  int32 leader_id = 4;
+  string error = 5;
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+  int64 client_id = 3;
+  int64 sequence_num = 4;
+}
+
+message PutResponse {
+  bool success = 1;
+  bool wrong_leader = 2;
+  int32 leader_id = 3;
+  string error = 4;
+}
+
+message AppendRequest {
+  string key = 1;
+  string value = 2;
+  int64 client_id = 3;
+  int64 sequence_num = 4;
+}
+
+message AppendResponse {
+  bool success = 1;
+  bool wrong_leader = 2;
+  int32 leader_id = 3;
+  string error = 4;
+}

@@ -66,6 +66,7 @@ func (r *Raft) becomeCandidate() {
 	r.currentTerm++
 	r.votedFor = r.serverId
 	r.state = Candidate
+	r.leaderId = -1 // Starting election - clear leader knowledge
 
 	// Reset vote count (self-vote = 1)
 	r.votesMutex.Lock()
@@ -157,6 +158,7 @@ func (r *Raft) stepDown(newTerm int) {
 	r.currentTerm = newTerm
 	r.votedFor = -1
 	r.state = Follower
+	r.leaderId = -1 // Clear leader knowledge when stepping down
 	r.resetElectionTimer()
 }
 
@@ -193,6 +195,7 @@ func (r *Raft) becomeLeader() {
 	}
 
 	r.state = Leader
+	r.leaderId = r.serverId // Self-aware: track self as leader
 
 	// Stop election timer - leader doesn't need it
 	r.stopElectionTimer()
