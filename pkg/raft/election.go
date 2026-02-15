@@ -128,11 +128,11 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 
 	// Handle response
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// Check if term changed while we were waiting (election already finished)
 	if r.currentTerm != term {
 		log.Printf("[Raft %d] Election already finished (term changed), ignoring vote from %d", r.serverId, peerId)
+		r.mu.Unlock()
 		return
 	}
 
@@ -140,6 +140,7 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 	if reply.Term > int64(r.currentTerm) {
 		log.Printf("[Raft %d] Received higher term %d from peer %d, stepping down", r.serverId, reply.Term, peerId)
 		r.stepDown(int(reply.Term))
+		r.mu.Unlock()
 		return
 	}
 
@@ -160,11 +161,12 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		if votes > len(r.peers)/2 && isCandidate {
 			r.mu.Unlock()
 			r.becomeLeader()
+			return
 		}
-		r.mu.Lock()
 	} else {
 		log.Printf("[Raft %d] Peer %d rejected vote request", r.serverId, peerId)
 	}
+	r.mu.Unlock()
 }
 
 // stepDown transitions the node to follower state with the given term.
