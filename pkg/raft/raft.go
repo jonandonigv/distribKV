@@ -165,7 +165,8 @@ func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (
 	}
 
 	// Initialize apply channel and conditions
-	r.applyCh = make(chan ApplyMsg, 10)
+	// Buffer size of 100 provides headroom for bursts while blocking send guarantees correctness
+	r.applyCh = make(chan ApplyMsg, 100)
 	r.replicationCond = sync.NewCond(&r.mu)
 	r.applyCond = sync.NewCond(&r.mu)
 
@@ -371,13 +372,11 @@ func (r *Raft) applyCommittedEntries() {
 				CommandIndex: int(entry.Index),
 			}
 
-			select {
-			case r.applyCh <- msg:
-			default:
-				log.Printf("[Raft %d] WARNING: applyCh full, dropping message", r.serverId)
-			}
+			// Blocking send guarantees message delivery (maintains Raft invariant)
+			// If applyLoop is stuck, this surfaces the problem rather than silently corrupting state
+			r.applyCh <- msg
 
-			// Update lastApplied
+			// Update lastApplied only after successful send
 			r.mu.Lock()
 			r.lastApplied = int(entry.Index)
 			r.mu.Unlock()
