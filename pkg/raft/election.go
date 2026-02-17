@@ -241,12 +241,10 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		VoteGranted: false,
 	}
 
-	// If candidate's term is lower, reject
 	if req.Term < int64(r.currentTerm) {
 		return reply, nil
 	}
 
-	// If candidate's term is higher, update our term and reset votedFor
 	if req.Term > int64(r.currentTerm) {
 		log.Printf("[Raft %d] Received RequestVote from candidate %d with higher term %d, updating term", r.serverId, req.CandidateId, req.Term)
 		r.currentTerm = int(req.Term)
@@ -256,23 +254,31 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		r.resetElectionTimer()
 	}
 
-	// Check if we can vote for this candidate
-	// Vote if: haven't voted yet, or already voted for this candidate
 	if r.votedFor == -1 || r.votedFor == int(req.CandidateId) {
-		// Check if candidate's log is at least as up-to-date as ours
-		// Note: Raft uses 1-based indexing (0 means empty log)
-		lastLogIndex := len(r.log) // 0 if empty, otherwise index of last entry
+		lastLogIndex := len(r.log)
 		lastLogTerm := 0
 		if lastLogIndex > 0 {
-			lastLogTerm = r.log[lastLogIndex-1].Term // Array is 0-based
+			lastLogTerm = r.log[lastLogIndex-1].Term
 		}
 
-		// Candidate's log is at least as up-to-date if:
-		// - Its last entry has a higher term, OR
-		// - Same term but log is at least as long
 		if req.LastLogTerm > int64(lastLogTerm) ||
 			(req.LastLogTerm == int64(lastLogTerm) && req.LastLogIndex >= int64(lastLogIndex)) {
-			r.votedFor = int(req.CandidateId)
+
+			newVotedFor := int(req.CandidateId)
+			newTerm := r.currentTerm
+			logCopy := r.log
+
+			r.mu.Unlock()
+			err := r.persister.Save(newTerm, newVotedFor, logCopy)
+			r.mu.Lock()
+
+			if err != nil {
+				log.Printf("[Raft %d] CRITICAL: Failed to persist vote for candidate %d: %v", r.serverId, req.CandidateId, err)
+				return nil, fmt.Errorf("failed to persist vote: %w", err)
+			}
+
+			r.votedFor = newVotedFor
+			r.currentTerm = newTerm
 			reply.VoteGranted = true
 			log.Printf("[Raft %d] Granted vote to candidate %d for term %d", r.serverId, req.CandidateId, req.Term)
 		} else {
@@ -283,13 +289,6 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		log.Printf("[Raft %d] Denied vote to candidate %d: already voted for %d in term %d",
 			r.serverId, req.CandidateId, r.votedFor, r.currentTerm)
 	}
-
-	// Persist state before responding (Raft requirement)
-	r.mu.Unlock()
-	if err := r.persist(); err != nil {
-		return nil, fmt.Errorf("failed to persist state: %w", err)
-	}
-	r.mu.Lock()
 
 	return reply, nil
 }

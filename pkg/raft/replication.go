@@ -32,78 +32,71 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		Success: false,
 	}
 
-	// If leader's term is lower, reject
 	if req.Term < int64(r.currentTerm) {
 		log.Printf("[Raft %d] Rejected AppendEntries from leader %d: stale term %d < %d", r.serverId, req.LeaderId, req.Term, r.currentTerm)
 		return reply, nil
 	}
 
-	// If leader's term is higher, update our term and convert to follower
+	savedCurrentTerm := r.currentTerm
+	savedVotedFor := r.votedFor
+	savedLog := make([]LogEntry, len(r.log))
+	copy(savedLog, r.log)
+
+	needRollback := false
+
 	if req.Term > int64(r.currentTerm) {
 		log.Printf("[Raft %d] Received AppendEntries from leader %d with higher term %d, updating term", r.serverId, req.LeaderId, req.Term)
 		r.currentTerm = int(req.Term)
 		r.votedFor = -1
 		r.state = Follower
 		reply.Term = req.Term
+		needRollback = true
 	}
 
-	// Track the leader (valid AppendEntries with current or higher term)
 	if r.leaderId != int(req.LeaderId) {
 		log.Printf("[Raft %d] Discovered leader %d for term %d", r.serverId, req.LeaderId, req.Term)
 	}
 	r.leaderId = int(req.LeaderId)
 
-	// Reset election timer - we've received valid heartbeat/append from leader
 	r.resetElectionTimer()
 
-	// Check if prevLogIndex matches
-	// prevLogIndex of 0 means leader has no previous log entry (empty log)
 	if req.PrevLogIndex > 0 {
-		// Check if we have the entry at prevLogIndex
 		if int(req.PrevLogIndex) > len(r.log) {
-			// We don't have enough entries
 			log.Printf("[Raft %d] Log mismatch at index %d: don't have entry", r.serverId, req.PrevLogIndex)
 			return reply, nil
 		}
-		// Check if term matches at prevLogIndex (convert 1-based to 0-based array index)
 		if r.log[req.PrevLogIndex-1].Term != int(req.PrevLogTerm) {
-			// Log conflict - delete this and all following entries
 			log.Printf("[Raft %d] Log conflict at index %d: term %d != %d, truncating log", r.serverId, req.PrevLogIndex, r.log[req.PrevLogIndex-1].Term, req.PrevLogTerm)
 			r.log = r.log[:req.PrevLogIndex-1]
 			return reply, nil
 		}
 	}
 
-	// Append new entries
 	entriesAppended := 0
-	// logIndex is 1-based, so we convert to 0-based array index when accessing r.log
 	for i, entry := range req.Entries {
-		logIndex := int(req.PrevLogIndex) + i // 1-based index of where this entry should go
-		arrayIndex := logIndex - 1            // 0-based index in the array
+		logIndex := int(req.PrevLogIndex) + i
+		arrayIndex := logIndex - 1
 
 		if arrayIndex < len(r.log) {
-			// We have an entry at this index - check for conflict
 			if r.log[arrayIndex].Term != int(entry.Term) {
-				// Conflict found - delete this and all following entries
 				log.Printf("[Raft %d] Conflict at index %d: replacing term %d with %d", r.serverId, logIndex, r.log[arrayIndex].Term, entry.Term)
 				r.log = r.log[:arrayIndex]
-				// Append the new entry
 				r.log = append(r.log, LogEntry{
 					Index:   entry.Index,
 					Term:    int(entry.Term),
 					Command: entry.Command,
 				})
 				entriesAppended++
+				needRollback = true
 			}
-			// If terms match, entry is already there, skip
 		} else {
-			// Append new entry
 			r.log = append(r.log, LogEntry{
 				Index:   entry.Index,
 				Term:    int(entry.Term),
 				Command: entry.Command,
 			})
 			entriesAppended++
+			needRollback = true
 		}
 	}
 
@@ -115,30 +108,20 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		}
 	}
 
-	// Update commitIndex if leaderCommit > commitIndex
-	// Note: logIndex is 1-based, commitIndex should also be 1-based
-	// SAFETY: Raft never commits log entries from previous terms by counting replicas.
-	// We only advance commitIndex if the entry at that index is from the current term.
 	oldCommitIndex := r.commitIndex
 	if req.LeaderCommit > int64(r.commitIndex) {
-		lastNewIndex := req.PrevLogIndex + int64(len(req.Entries)) // 1-based
+		lastNewIndex := req.PrevLogIndex + int64(len(req.Entries))
 		newCommitIndex := req.LeaderCommit
 		if req.LeaderCommit > lastNewIndex {
 			newCommitIndex = lastNewIndex
 		}
 
-		// Only commit entries from the current term
-		// Entries from previous terms can only be committed indirectly once
-		// an entry from the current term is committed (Log Matching Property)
 		for i := r.commitIndex + 1; i <= int(newCommitIndex); i++ {
-			arrayIndex := i - 1 // Convert to 0-based
+			arrayIndex := i - 1
 			if arrayIndex >= len(r.log) {
-				// Don't have this entry yet, stop here
 				break
 			}
 			if r.log[arrayIndex].Term != r.currentTerm {
-				// Entry is from a previous term, don't commit it yet
-				// Wait until leader commits an entry from current term
 				break
 			}
 			r.commitIndex = i
@@ -149,12 +132,19 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		}
 	}
 
-	// Persist state before responding (Raft requirement)
-	r.mu.Unlock()
-	if err := r.persist(); err != nil {
-		return nil, fmt.Errorf("failed to persist state: %w", err)
+	if needRollback {
+		r.mu.Unlock()
+		err := r.persister.Save(r.currentTerm, r.votedFor, r.log)
+		r.mu.Lock()
+
+		if err != nil {
+			log.Printf("[Raft %d] CRITICAL: Failed to persist state, rolling back: %v", r.serverId, err)
+			r.currentTerm = savedCurrentTerm
+			r.votedFor = savedVotedFor
+			r.log = savedLog
+			return nil, fmt.Errorf("failed to persist state: %w", err)
+		}
 	}
-	r.mu.Lock()
 
 	reply.Success = true
 	return reply, nil
