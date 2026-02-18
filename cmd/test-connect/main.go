@@ -27,7 +27,7 @@ func main() {
 	defer cancel()
 
 	// Create Raft node (will try to connect to all peers)
-	r, err := raft.NewRaft(*serverId, peerAddresses, ctx)
+	r, err := raft.NewRaft(*serverId, peerAddresses, "./data/test", ctx)
 	if err != nil {
 		log.Fatalf("Failed to create Raft node: %v", err)
 	}

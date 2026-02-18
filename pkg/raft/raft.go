@@ -114,7 +114,7 @@ func deriveIdFromAddress(address string) int {
 	return port % 10000
 }
 
-func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (*Raft, error) {
+func NewRaft(serverId int, peerAddresses []string, dataDir string, connectCtx context.Context) (*Raft, error) {
 	r := &Raft{
 		serverId:                serverId,
 		peers:                   make(map[int]*Peer),
@@ -155,7 +155,6 @@ func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (
 	}
 
 	// Initialize persister and load persisted state
-	dataDir := "./data"
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
