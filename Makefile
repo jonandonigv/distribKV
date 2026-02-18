@@ -21,7 +21,7 @@ all: tidy build
 build: kvserver server client
 
 kvserver:
-	go build -o bin/kvserver ./cmd/raft-kv-server
+	go build -o bin/kvserver ./cmd/kvserver
 
 server:
 	go build -o bin/grpc-test-server ./cmd/grpc-test-server
