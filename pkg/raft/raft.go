@@ -71,11 +71,14 @@ type Raft struct {
 	replicationCond *sync.Cond // Signals when commitIndex advances
 
 	// Apply channel for state machine
-	applyCh   chan ApplyMsg // Buffer size: 10
+	applyCh   chan ApplyMsg // Buffer size: 100
 	applyCond *sync.Cond    // Signals apply goroutine
 
 	// Persister for durability
 	persister *Persister
+
+	// Debug mode for verbose logging
+	debug bool
 }
 
 // ApplyMsg is sent to the application (KV service) when a log entry is committed.
@@ -326,6 +329,22 @@ func (r *Raft) SetDeterministicTimeout(timeout time.Duration) {
 	defer r.mu.Unlock()
 	r.useDeterministicTimeout = true
 	r.deterministicTimeout = timeout
+}
+
+// SetDebug enables or disables debug logging for hot paths.
+// When disabled (default), only important state changes and errors are logged.
+func (r *Raft) SetDebug(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.debug = enabled
+}
+
+// debugLog logs a message only when debug mode is enabled.
+// Use for hot path logging that would otherwise create noise.
+func (r *Raft) debugLog(format string, args ...interface{}) {
+	if r.debug {
+		log.Printf(format, args...)
+	}
 }
 
 // getLastLogInfo returns the index and term of the last log entry.

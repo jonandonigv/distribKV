@@ -85,7 +85,7 @@ func (r *Raft) becomeCandidate() {
 	// Reset election timer for this term (self-vote resets timer)
 	r.resetElectionTimer()
 
-	log.Printf("[Raft %d] Sending RequestVote to %d peers (term %d)", r.serverId, len(r.peers), term)
+	r.debugLog("[Raft %d] Sending RequestVote to %d peers (term %d)", r.serverId, len(r.peers), term)
 
 	// Send RequestVote to all peers concurrently
 	for peerId := range r.peers {
@@ -151,7 +151,7 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		votes := r.votesReceived
 		r.votesMutex.Unlock()
 
-		log.Printf("[Raft %d] Received vote from peer %d (total: %d/%d)", r.serverId, peerId, votes, len(r.peers)/2+1)
+		r.debugLog("[Raft %d] Received vote from peer %d (total: %d/%d)", r.serverId, peerId, votes, len(r.peers)/2+1)
 
 		// Check if we have majority and are still a candidate
 		// Must hold r.mu when reading r.state to avoid race condition
@@ -164,7 +164,7 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 			return
 		}
 	} else {
-		log.Printf("[Raft %d] Peer %d rejected vote request", r.serverId, peerId)
+		r.debugLog("[Raft %d] Peer %d rejected vote request", r.serverId, peerId)
 	}
 	r.mu.Unlock()
 }

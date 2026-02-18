@@ -102,9 +102,9 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 
 	if len(req.Entries) > 0 {
 		if entriesAppended > 0 {
-			log.Printf("[Raft %d] Appended %d/%d entries from leader (log size: %d)", r.serverId, entriesAppended, len(req.Entries), len(r.log))
+			r.debugLog("[Raft %d] Appended %d/%d entries from leader (log size: %d)", r.serverId, entriesAppended, len(req.Entries), len(r.log))
 		} else {
-			log.Printf("[Raft %d] All %d entries already present (heartbeat)", r.serverId, len(req.Entries))
+			r.debugLog("[Raft %d] All %d entries already present (heartbeat)", r.serverId, len(req.Entries))
 		}
 	}
 
@@ -307,7 +307,7 @@ func (r *Raft) sendAppendEntries(peerId int) {
 		newMatchIndex := prevLogIndex + len(entries)
 		if newMatchIndex > peer.matchIndex {
 			peer.matchIndex = newMatchIndex
-			log.Printf("[Raft %d] Peer %d replicated up to index %d", r.serverId, peerId, peer.matchIndex)
+			r.debugLog("[Raft %d] Peer %d replicated up to index %d", r.serverId, peerId, peer.matchIndex)
 		}
 		peer.nextIndex = peer.matchIndex + 1
 
@@ -316,7 +316,7 @@ func (r *Raft) sendAppendEntries(peerId int) {
 		r.mu.Unlock()
 	} else {
 		// Log mismatch - decrement nextIndex and retry
-		log.Printf("[Raft %d] Peer %d rejected AppendEntries (log mismatch), retrying with nextIndex=%d", r.serverId, peerId, peer.nextIndex-1)
+		r.debugLog("[Raft %d] Peer %d rejected AppendEntries (log mismatch), retrying with nextIndex=%d", r.serverId, peerId, peer.nextIndex-1)
 		if peer.nextIndex > 1 {
 			peer.nextIndex--
 		}
