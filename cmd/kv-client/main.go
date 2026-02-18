@@ -21,7 +21,12 @@ func main() {
 		log.Fatal("Must specify -peers")
 	}
 
-	command := os.Args[1]
+	command := parseCommand()
+	if command == "" {
+		printUsage()
+		os.Exit(1)
+	}
+
 	verbose := hasFlag("-v") || hasFlag("--verbose")
 
 	ck := kvserver.MakeClerk(peers, verbose)
@@ -70,6 +75,15 @@ func parsePeersFlag() []string {
 		}
 	}
 	return nil
+}
+
+func parseCommand() string {
+	for _, arg := range os.Args[1:] {
+		if !strings.HasPrefix(arg, "-") {
+			return arg
+		}
+	}
+	return ""
 }
 
 func hasFlag(flag string) bool {
