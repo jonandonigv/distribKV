@@ -185,14 +185,22 @@ func (r *Raft) ReplicateCommand(cmd []byte) (int, error) {
 		return 0, fmt.Errorf("failed to persist: %w", err)
 	}
 
-	// Trigger immediate replication to all peers
+	// Collect peer IDs while holding lock, then spawn goroutines after releasing
+	peerIds := make([]int, 0, len(r.peers))
 	for peerId := range r.peers {
-		go r.sendAppendEntries(peerId)
+		peerIds = append(peerIds, peerId)
 	}
 
-	// Remember target index and release lock
+	// Remember target index
 	targetIndex := nextIndex
+
+	// Release lock BEFORE spawning goroutines to allow parallel execution
 	r.mu.Unlock()
+
+	// Spawn goroutines without holding lock - sendAppendEntries will acquire its own lock
+	for _, peerId := range peerIds {
+		go r.sendAppendEntries(peerId)
+	}
 
 	// Wait for commit with timeout (5 seconds)
 	log.Printf("[Raft %d] Waiting for command %d to commit...", r.serverId, targetIndex)
@@ -279,10 +287,10 @@ func (r *Raft) sendAppendEntries(peerId int) {
 
 	// Handle response
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// Check if we're still leader and term hasn't changed
 	if r.state != Leader || r.currentTerm != int(args.Term) {
+		r.mu.Unlock()
 		return
 	}
 
@@ -290,6 +298,7 @@ func (r *Raft) sendAppendEntries(peerId int) {
 	if reply.Term > int64(r.currentTerm) {
 		log.Printf("[Raft %d] Peer %d has higher term %d, stepping down", r.serverId, peerId, reply.Term)
 		r.stepDown(int(reply.Term))
+		r.mu.Unlock()
 		return
 	}
 
@@ -304,13 +313,15 @@ func (r *Raft) sendAppendEntries(peerId int) {
 
 		// Try to advance commit index
 		r.updateCommitIndex()
+		r.mu.Unlock()
 	} else {
 		// Log mismatch - decrement nextIndex and retry
 		log.Printf("[Raft %d] Peer %d rejected AppendEntries (log mismatch), retrying with nextIndex=%d", r.serverId, peerId, peer.nextIndex-1)
 		if peer.nextIndex > 1 {
 			peer.nextIndex--
 		}
-		// Trigger immediate retry
+		r.mu.Unlock()
+		// Spawn retry goroutine AFTER releasing lock
 		go r.sendAppendEntries(peerId)
 	}
 }
