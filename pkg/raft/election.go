@@ -102,6 +102,15 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		return
 	}
 
+	// Ensure connection is healthy
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	if err := peer.ensureConnected(connectCtx); err != nil {
+		connectCancel()
+		log.Printf("[Raft %d] Cannot reach peer %d: %v", r.serverId, peerId, err)
+		return
+	}
+	connectCancel()
+
 	// Get last log info
 	r.mu.Lock()
 	lastLogIndex, lastLogTerm := r.getLastLogInfo()
@@ -115,8 +124,8 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		LastLogTerm:  int64(lastLogTerm),
 	}
 
-	// Make RPC call with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Make RPC call with timeout (fast operation, no log transfer)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	reply, err := peer.raftClient.RequestVote(ctx, args)

@@ -15,6 +15,7 @@ import (
 
 	"github.com/jonandonigv/distribKV/pkg/common"
 	pb "github.com/jonandonigv/distribKV/proto/raft"
+	"google.golang.org/grpc/connectivity"
 )
 
 // Replication errors
@@ -281,15 +282,18 @@ func (r *Raft) ConnectPeers(ctx context.Context) error {
 // This provides auto-retry functionality for failed connections.
 func (p *Peer) ensureConnected(ctx context.Context) error {
 	if p.client != nil && p.raftClient != nil {
-		// TODO: Add health check to verify connection is still alive
-		// For now, assume connection is good if initialized
-		return nil
+		conn := p.client.Conn()
+		if conn != nil {
+			state := conn.GetState()
+			if state == connectivity.Ready || state == connectivity.Idle {
+				return nil
+			}
+		}
 	}
 
-	// Connection lost or never established, reconnect
 	p.client = common.NewClient(p.address)
 
-	connectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	connectCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
 	if err := p.client.Connect(connectCtx); err != nil {

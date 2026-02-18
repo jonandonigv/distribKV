@@ -10,6 +10,7 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 type Server struct {
@@ -97,9 +98,16 @@ func (c *Client) Connect(ctx context.Context) error {
 		return nil
 	}
 
+	kacp := keepalive.ClientParameters{
+		Time:                10 * time.Second,
+		Timeout:             3 * time.Second,
+		PermitWithoutStream: true,
+	}
+
 	conn, err := grpc.NewClient(
 		c.target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(kacp),
 	)
 	if err != nil {
 		return err

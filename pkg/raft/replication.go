@@ -234,6 +234,15 @@ func (r *Raft) sendAppendEntries(peerId int) {
 		return
 	}
 
+	// Ensure connection is healthy
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	if err := peer.ensureConnected(connectCtx); err != nil {
+		connectCancel()
+		log.Printf("[Raft %d] Cannot reach peer %d: %v", r.serverId, peerId, err)
+		return
+	}
+	connectCancel()
+
 	r.mu.Lock()
 	if r.state != Leader {
 		r.mu.Unlock()
@@ -274,8 +283,8 @@ func (r *Raft) sendAppendEntries(peerId int) {
 	}
 	r.mu.Unlock()
 
-	// Make RPC call with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Make RPC call with timeout (heartbeat should be fast)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
 	reply, err := peer.raftClient.AppendEntries(ctx, args)
