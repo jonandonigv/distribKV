@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/jonandonigv/distribKV/proto/raft"
@@ -23,30 +24,64 @@ func (r *Raft) runElectionTimer() {
 		} else {
 			timeout = r.electionTimeoutMin + time.Duration(rand.Intn(int(r.electionTimeoutMax-r.electionTimeoutMin)))
 		}
+		doneChan := r.electionDoneChan
 		r.mu.Unlock()
 
 		timer := time.NewTimer(timeout)
 
-		select {
-		case <-timer.C:
-			// Timer expired - start new election
-			log.Printf("[Raft %d] Election timeout fired (no heartbeat), starting election", r.serverId)
-			r.becomeCandidate()
-
-		case <-r.electionResetChan:
-			// Reset requested - drain any additional reset signals and continue
-			timer.Stop()
+		// Build select cases dynamically
+		if doneChan != nil {
+			// Election in progress - wait for completion or timeout
 			select {
-			case <-r.electionResetChan:
-				// Drain additional resets
-			default:
-			}
-			continue
+			case <-timer.C:
+				// Timer expired - start new election
+				log.Printf("[Raft %d] Election timeout fired (no heartbeat), starting election", r.serverId)
+				r.becomeCandidate()
 
-		case <-r.electionStopChan:
-			// Stop requested - exit goroutine
-			timer.Stop()
-			return
+			case <-doneChan:
+				// All RPCs completed - start new election immediately
+				timer.Stop()
+				log.Printf("[Raft %d] Election completed without majority, starting new election", r.serverId)
+				r.becomeCandidate()
+
+			case <-r.electionResetChan:
+				// Reset requested - drain any additional reset signals and continue
+				timer.Stop()
+				select {
+				case <-r.electionResetChan:
+					// Drain additional resets
+				default:
+				}
+				continue
+
+			case <-r.electionStopChan:
+				// Stop requested - exit goroutine
+				timer.Stop()
+				return
+			}
+		} else {
+			// No election in progress - normal timeout behavior
+			select {
+			case <-timer.C:
+				// Timer expired - start new election
+				log.Printf("[Raft %d] Election timeout fired (no heartbeat), starting election", r.serverId)
+				r.becomeCandidate()
+
+			case <-r.electionResetChan:
+				// Reset requested - drain any additional reset signals and continue
+				timer.Stop()
+				select {
+				case <-r.electionResetChan:
+					// Drain additional resets
+				default:
+				}
+				continue
+
+			case <-r.electionStopChan:
+				// Stop requested - exit goroutine
+				timer.Stop()
+				return
+			}
 		}
 	}
 }
@@ -78,6 +113,10 @@ func (r *Raft) becomeCandidate() {
 	r.votesReceived = 1
 	r.votesMutex.Unlock()
 
+	// Initialize election tracking
+	r.pendingVoteRpcs = int32(len(r.peers))
+	r.electionDoneChan = make(chan struct{})
+
 	// Get current term for RPC calls
 	term := r.currentTerm
 	r.mu.Unlock()
@@ -86,6 +125,12 @@ func (r *Raft) becomeCandidate() {
 	r.resetElectionTimer()
 
 	r.debugLog("[Raft %d] Sending RequestVote to %d peers (term %d)", r.serverId, len(r.peers), term)
+
+	// Handle edge case: no peers (single-node cluster)
+	if len(r.peers) == 0 {
+		close(r.electionDoneChan)
+		return
+	}
 
 	// Send RequestVote to all peers concurrently
 	for peerId := range r.peers {
@@ -96,6 +141,18 @@ func (r *Raft) becomeCandidate() {
 // sendRequestVote sends a RequestVote RPC to a specific peer.
 // It handles RPC failures, vote grants, and higher term detection.
 func (r *Raft) sendRequestVote(peerId int, term int) {
+	// Track RPC completion
+	defer func() {
+		if atomic.AddInt32(&r.pendingVoteRpcs, -1) == 0 {
+			r.mu.Lock()
+			if r.electionDoneChan != nil {
+				close(r.electionDoneChan)
+				r.electionDoneChan = nil
+			}
+			r.mu.Unlock()
+		}
+	}()
+
 	// Get peer
 	peer, ok := r.peers[peerId]
 	if !ok {
@@ -180,12 +237,25 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 
 // stepDown transitions the node to follower state with the given term.
 // It updates the term, resets votedFor, and resets the election timer.
+// Must be called while holding r.mu.
 func (r *Raft) stepDown(newTerm int) {
 	oldState := r.state
 	r.currentTerm = newTerm
 	r.votedFor = -1
 	r.state = Follower
 	r.leaderId = -1 // Clear leader knowledge when stepping down
+
+	// Clear election tracking
+	if r.electionDoneChan != nil {
+		select {
+		case <-r.electionDoneChan:
+			// Already closed
+		default:
+			close(r.electionDoneChan)
+		}
+		r.electionDoneChan = nil
+	}
+
 	log.Printf("[Raft %d] State change: %v -> Follower (term %d)", r.serverId, oldState, newTerm)
 	r.resetElectionTimer()
 }
@@ -225,6 +295,9 @@ func (r *Raft) becomeLeader() {
 	log.Printf("[Raft %d] *** ELECTED LEADER (term %d) ***", r.serverId, r.currentTerm)
 	r.state = Leader
 	r.leaderId = r.serverId // Self-aware: track self as leader
+
+	// Clear election tracking (we won, no need for electionDoneChan)
+	r.electionDoneChan = nil
 
 	// Stop election timer - leader doesn't need it
 	r.stopElectionTimer()

@@ -60,6 +60,10 @@ type Raft struct {
 	useDeterministicTimeout bool
 	deterministicTimeout    time.Duration
 
+	// Election coordination
+	pendingVoteRpcs  int32
+	electionDoneChan chan struct{}
+
 	// Vote counting (only used during candidacy)
 	votesReceived int
 	votesMutex    sync.Mutex
