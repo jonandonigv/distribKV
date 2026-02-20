@@ -36,7 +36,19 @@ func (s *Server) Start() error {
 		return err
 	}
 
-	s.srv = grpc.NewServer()
+	kaep := keepalive.EnforcementPolicy{
+		MinTime:             5 * time.Second,
+		PermitWithoutStream: true,
+	}
+	kasp := keepalive.ServerParameters{
+		Time:    10 * time.Second,
+		Timeout: 3 * time.Second,
+	}
+
+	s.srv = grpc.NewServer(
+		grpc.KeepaliveEnforcementPolicy(kaep),
+		grpc.KeepaliveParams(kasp),
+	)
 
 	go func() {
 		log.Printf("gRPC server listening on %s", s.addr)
