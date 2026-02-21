@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/jonandonigv/distribKV/proto/raft"
@@ -23,30 +24,64 @@ func (r *Raft) runElectionTimer() {
 		} else {
 			timeout = r.electionTimeoutMin + time.Duration(rand.Intn(int(r.electionTimeoutMax-r.electionTimeoutMin)))
 		}
+		doneChan := r.electionDoneChan
 		r.mu.Unlock()
 
 		timer := time.NewTimer(timeout)
 
-		select {
-		case <-timer.C:
-			// Timer expired - start new election
-			log.Printf("[Raft %d] Election timeout fired (no heartbeat), starting election", r.serverId)
-			r.becomeCandidate()
-
-		case <-r.electionResetChan:
-			// Reset requested - drain any additional reset signals and continue
-			timer.Stop()
+		// Build select cases dynamically
+		if doneChan != nil {
+			// Election in progress - wait for completion or timeout
 			select {
-			case <-r.electionResetChan:
-				// Drain additional resets
-			default:
-			}
-			continue
+			case <-timer.C:
+				// Timer expired - start new election
+				log.Printf("[Raft %d] Election timeout fired (no heartbeat), starting election", r.serverId)
+				r.becomeCandidate()
 
-		case <-r.electionStopChan:
-			// Stop requested - exit goroutine
-			timer.Stop()
-			return
+			case <-doneChan:
+				// All RPCs completed - start new election immediately
+				timer.Stop()
+				log.Printf("[Raft %d] Election completed without majority, starting new election", r.serverId)
+				r.becomeCandidate()
+
+			case <-r.electionResetChan:
+				// Reset requested - drain any additional reset signals and continue
+				timer.Stop()
+				select {
+				case <-r.electionResetChan:
+					// Drain additional resets
+				default:
+				}
+				continue
+
+			case <-r.electionStopChan:
+				// Stop requested - exit goroutine
+				timer.Stop()
+				return
+			}
+		} else {
+			// No election in progress - normal timeout behavior
+			select {
+			case <-timer.C:
+				// Timer expired - start new election
+				log.Printf("[Raft %d] Election timeout fired (no heartbeat), starting election", r.serverId)
+				r.becomeCandidate()
+
+			case <-r.electionResetChan:
+				// Reset requested - drain any additional reset signals and continue
+				timer.Stop()
+				select {
+				case <-r.electionResetChan:
+					// Drain additional resets
+				default:
+				}
+				continue
+
+			case <-r.electionStopChan:
+				// Stop requested - exit goroutine
+				timer.Stop()
+				return
+			}
 		}
 	}
 }
@@ -78,6 +113,10 @@ func (r *Raft) becomeCandidate() {
 	r.votesReceived = 1
 	r.votesMutex.Unlock()
 
+	// Initialize election tracking
+	r.pendingVoteRpcs = int32(len(r.peers))
+	r.electionDoneChan = make(chan struct{})
+
 	// Get current term for RPC calls
 	term := r.currentTerm
 	r.mu.Unlock()
@@ -85,7 +124,13 @@ func (r *Raft) becomeCandidate() {
 	// Reset election timer for this term (self-vote resets timer)
 	r.resetElectionTimer()
 
-	log.Printf("[Raft %d] Sending RequestVote to %d peers (term %d)", r.serverId, len(r.peers), term)
+	r.debugLog("[Raft %d] Sending RequestVote to %d peers (term %d)", r.serverId, len(r.peers), term)
+
+	// Handle edge case: no peers (single-node cluster)
+	if len(r.peers) == 0 {
+		close(r.electionDoneChan)
+		return
+	}
 
 	// Send RequestVote to all peers concurrently
 	for peerId := range r.peers {
@@ -96,11 +141,32 @@ func (r *Raft) becomeCandidate() {
 // sendRequestVote sends a RequestVote RPC to a specific peer.
 // It handles RPC failures, vote grants, and higher term detection.
 func (r *Raft) sendRequestVote(peerId int, term int) {
+	// Track RPC completion
+	defer func() {
+		if atomic.AddInt32(&r.pendingVoteRpcs, -1) == 0 {
+			r.mu.Lock()
+			if r.electionDoneChan != nil {
+				close(r.electionDoneChan)
+				r.electionDoneChan = nil
+			}
+			r.mu.Unlock()
+		}
+	}()
+
 	// Get peer
 	peer, ok := r.peers[peerId]
 	if !ok {
 		return
 	}
+
+	// Ensure connection is healthy
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	if err := peer.ensureConnected(connectCtx); err != nil {
+		connectCancel()
+		log.Printf("[Raft %d] Cannot reach peer %d: %v", r.serverId, peerId, err)
+		return
+	}
+	connectCancel()
 
 	// Get last log info
 	r.mu.Lock()
@@ -115,8 +181,8 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		LastLogTerm:  int64(lastLogTerm),
 	}
 
-	// Make RPC call with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Make RPC call with timeout (fast operation, no log transfer)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 
 	reply, err := peer.raftClient.RequestVote(ctx, args)
@@ -128,11 +194,11 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 
 	// Handle response
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// Check if term changed while we were waiting (election already finished)
 	if r.currentTerm != term {
 		log.Printf("[Raft %d] Election already finished (term changed), ignoring vote from %d", r.serverId, peerId)
+		r.mu.Unlock()
 		return
 	}
 
@@ -140,6 +206,7 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 	if reply.Term > int64(r.currentTerm) {
 		log.Printf("[Raft %d] Received higher term %d from peer %d, stepping down", r.serverId, reply.Term, peerId)
 		r.stepDown(int(reply.Term))
+		r.mu.Unlock()
 		return
 	}
 
@@ -150,30 +217,45 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 		votes := r.votesReceived
 		r.votesMutex.Unlock()
 
-		log.Printf("[Raft %d] Received vote from peer %d (total: %d/%d)", r.serverId, peerId, votes, len(r.peers)/2+1)
+		r.debugLog("[Raft %d] Received vote from peer %d (total: %d/%d)", r.serverId, peerId, votes, len(r.peers)/2+1)
 
 		// Check if we have majority and are still a candidate
 		// Must hold r.mu when reading r.state to avoid race condition
-		r.mu.Lock()
+
 		isCandidate := r.state == Candidate
-		r.mu.Unlock()
 
 		if votes > len(r.peers)/2 && isCandidate {
+			r.mu.Unlock()
 			r.becomeLeader()
+			return
 		}
 	} else {
-		log.Printf("[Raft %d] Peer %d rejected vote request", r.serverId, peerId)
+		r.debugLog("[Raft %d] Peer %d rejected vote request", r.serverId, peerId)
 	}
+	r.mu.Unlock()
 }
 
 // stepDown transitions the node to follower state with the given term.
 // It updates the term, resets votedFor, and resets the election timer.
+// Must be called while holding r.mu.
 func (r *Raft) stepDown(newTerm int) {
 	oldState := r.state
 	r.currentTerm = newTerm
 	r.votedFor = -1
 	r.state = Follower
 	r.leaderId = -1 // Clear leader knowledge when stepping down
+
+	// Clear election tracking
+	if r.electionDoneChan != nil {
+		select {
+		case <-r.electionDoneChan:
+			// Already closed
+		default:
+			close(r.electionDoneChan)
+		}
+		r.electionDoneChan = nil
+	}
+
 	log.Printf("[Raft %d] State change: %v -> Follower (term %d)", r.serverId, oldState, newTerm)
 	r.resetElectionTimer()
 }
@@ -214,6 +296,9 @@ func (r *Raft) becomeLeader() {
 	r.state = Leader
 	r.leaderId = r.serverId // Self-aware: track self as leader
 
+	// Clear election tracking (we won, no need for electionDoneChan)
+	r.electionDoneChan = nil
+
 	// Stop election timer - leader doesn't need it
 	r.stopElectionTimer()
 
@@ -238,12 +323,10 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		VoteGranted: false,
 	}
 
-	// If candidate's term is lower, reject
 	if req.Term < int64(r.currentTerm) {
 		return reply, nil
 	}
 
-	// If candidate's term is higher, update our term and reset votedFor
 	if req.Term > int64(r.currentTerm) {
 		log.Printf("[Raft %d] Received RequestVote from candidate %d with higher term %d, updating term", r.serverId, req.CandidateId, req.Term)
 		r.currentTerm = int(req.Term)
@@ -253,23 +336,31 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 		r.resetElectionTimer()
 	}
 
-	// Check if we can vote for this candidate
-	// Vote if: haven't voted yet, or already voted for this candidate
 	if r.votedFor == -1 || r.votedFor == int(req.CandidateId) {
-		// Check if candidate's log is at least as up-to-date as ours
-		// Note: Raft uses 1-based indexing (0 means empty log)
-		lastLogIndex := len(r.log) // 0 if empty, otherwise index of last entry
+		lastLogIndex := len(r.log)
 		lastLogTerm := 0
 		if lastLogIndex > 0 {
-			lastLogTerm = r.log[lastLogIndex-1].Term // Array is 0-based
+			lastLogTerm = r.log[lastLogIndex-1].Term
 		}
 
-		// Candidate's log is at least as up-to-date if:
-		// - Its last entry has a higher term, OR
-		// - Same term but log is at least as long
 		if req.LastLogTerm > int64(lastLogTerm) ||
 			(req.LastLogTerm == int64(lastLogTerm) && req.LastLogIndex >= int64(lastLogIndex)) {
-			r.votedFor = int(req.CandidateId)
+
+			newVotedFor := int(req.CandidateId)
+			newTerm := r.currentTerm
+			logCopy := r.log
+
+			r.mu.Unlock()
+			err := r.persister.Save(newTerm, newVotedFor, logCopy)
+			r.mu.Lock()
+
+			if err != nil {
+				log.Printf("[Raft %d] CRITICAL: Failed to persist vote for candidate %d: %v", r.serverId, req.CandidateId, err)
+				return nil, fmt.Errorf("failed to persist vote: %w", err)
+			}
+
+			r.votedFor = newVotedFor
+			r.currentTerm = newTerm
 			reply.VoteGranted = true
 			log.Printf("[Raft %d] Granted vote to candidate %d for term %d", r.serverId, req.CandidateId, req.Term)
 		} else {
@@ -279,11 +370,6 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 	} else {
 		log.Printf("[Raft %d] Denied vote to candidate %d: already voted for %d in term %d",
 			r.serverId, req.CandidateId, r.votedFor, r.currentTerm)
-	}
-
-	// Persist state before responding (Raft requirement)
-	if err := r.persist(); err != nil {
-		return nil, fmt.Errorf("failed to persist state: %w", err)
 	}
 
 	return reply, nil

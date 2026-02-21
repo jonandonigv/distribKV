@@ -36,11 +36,13 @@ func (kv *KVServer) processApplyMsg(msg raft.ApplyMsg) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
-	// Deserialize the command
 	cmd, err := kv.deserializeCommand(msg.Command)
 	if err != nil {
-		// Panic on corruption - this should never happen
-		panic(fmt.Sprintf("failed to deserialize command: %v", err))
+		log.Printf("[KV] CRITICAL: Failed to deserialize command at index %d: %v. Raw bytes: %x",
+			msg.CommandIndex, err, msg.Command)
+
+		kv.notifyWaiter(msg.CommandIndex, Result{Err: fmt.Errorf("command corrupted: %w", err)})
+		return
 	}
 
 	// Check if this is a duplicate operation
@@ -53,7 +55,7 @@ func (kv *KVServer) processApplyMsg(msg raft.ApplyMsg) {
 
 	// Apply command to state machine
 	result := kv.applyCommand(cmd)
-	log.Printf("[KV] Applied %s operation (index %d): key=%s", cmd.Type, msg.CommandIndex, cmd.Key)
+	log.Printf("[KV] Applied %v operation (index %d): key=%s", cmd.Type, msg.CommandIndex, cmd.Key)
 
 	// Save result to duplicate cache
 	kv.saveDuplicate(cmd.ClientId, cmd.SequenceId, result)

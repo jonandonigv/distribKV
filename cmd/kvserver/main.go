@@ -60,7 +60,7 @@ func main() {
 	defer cancel()
 
 	// Initialize Raft
-	rf, err := raft.NewRaft(*id, peerList, ctx)
+	rf, err := raft.NewRaft(*id, peerList, *dataDir, ctx)
 	if err != nil {
 		log.Fatalf("Failed to create Raft node: %v", err)
 	}

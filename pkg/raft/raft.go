@@ -15,6 +15,7 @@ import (
 
 	"github.com/jonandonigv/distribKV/pkg/common"
 	pb "github.com/jonandonigv/distribKV/proto/raft"
+	"google.golang.org/grpc/connectivity"
 )
 
 // Replication errors
@@ -59,6 +60,10 @@ type Raft struct {
 	useDeterministicTimeout bool
 	deterministicTimeout    time.Duration
 
+	// Election coordination
+	pendingVoteRpcs  int32
+	electionDoneChan chan struct{}
+
 	// Vote counting (only used during candidacy)
 	votesReceived int
 	votesMutex    sync.Mutex
@@ -71,11 +76,14 @@ type Raft struct {
 	replicationCond *sync.Cond // Signals when commitIndex advances
 
 	// Apply channel for state machine
-	applyCh   chan ApplyMsg // Buffer size: 10
+	applyCh   chan ApplyMsg // Buffer size: 100
 	applyCond *sync.Cond    // Signals apply goroutine
 
 	// Persister for durability
 	persister *Persister
+
+	// Debug mode for verbose logging
+	debug bool
 }
 
 // ApplyMsg is sent to the application (KV service) when a log entry is committed.
@@ -111,7 +119,7 @@ func deriveIdFromAddress(address string) int {
 	return port % 10000
 }
 
-func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (*Raft, error) {
+func NewRaft(serverId int, peerAddresses []string, dataDir string, connectCtx context.Context) (*Raft, error) {
 	r := &Raft{
 		serverId:                serverId,
 		peers:                   make(map[int]*Peer),
@@ -152,7 +160,6 @@ func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (
 	}
 
 	// Initialize persister and load persisted state
-	dataDir := "./data"
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
@@ -165,7 +172,8 @@ func NewRaft(serverId int, peerAddresses []string, connectCtx context.Context) (
 	}
 
 	// Initialize apply channel and conditions
-	r.applyCh = make(chan ApplyMsg, 10)
+	// Buffer size of 100 provides headroom for bursts while blocking send guarantees correctness
+	r.applyCh = make(chan ApplyMsg, 100)
 	r.replicationCond = sync.NewCond(&r.mu)
 	r.applyCond = sync.NewCond(&r.mu)
 
@@ -278,15 +286,18 @@ func (r *Raft) ConnectPeers(ctx context.Context) error {
 // This provides auto-retry functionality for failed connections.
 func (p *Peer) ensureConnected(ctx context.Context) error {
 	if p.client != nil && p.raftClient != nil {
-		// TODO: Add health check to verify connection is still alive
-		// For now, assume connection is good if initialized
-		return nil
+		conn := p.client.Conn()
+		if conn != nil {
+			state := conn.GetState()
+			if state == connectivity.Ready || state == connectivity.Idle {
+				return nil
+			}
+		}
 	}
 
-	// Connection lost or never established, reconnect
 	p.client = common.NewClient(p.address)
 
-	connectCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	connectCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
 
 	if err := p.client.Connect(connectCtx); err != nil {
@@ -325,6 +336,22 @@ func (r *Raft) SetDeterministicTimeout(timeout time.Duration) {
 	defer r.mu.Unlock()
 	r.useDeterministicTimeout = true
 	r.deterministicTimeout = timeout
+}
+
+// SetDebug enables or disables debug logging for hot paths.
+// When disabled (default), only important state changes and errors are logged.
+func (r *Raft) SetDebug(enabled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.debug = enabled
+}
+
+// debugLog logs a message only when debug mode is enabled.
+// Use for hot path logging that would otherwise create noise.
+func (r *Raft) debugLog(format string, args ...interface{}) {
+	if r.debug {
+		log.Printf(format, args...)
+	}
 }
 
 // getLastLogInfo returns the index and term of the last log entry.
@@ -371,10 +398,11 @@ func (r *Raft) applyCommittedEntries() {
 				CommandIndex: int(entry.Index),
 			}
 
-			// Send to apply channel (blocking)
+			// Blocking send guarantees message delivery (maintains Raft invariant)
+			// If applyLoop is stuck, this surfaces the problem rather than silently corrupting state
 			r.applyCh <- msg
 
-			// Update lastApplied
+			// Update lastApplied only after successful send
 			r.mu.Lock()
 			r.lastApplied = int(entry.Index)
 			r.mu.Unlock()

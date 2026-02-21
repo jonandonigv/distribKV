@@ -32,113 +32,96 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		Success: false,
 	}
 
-	// If leader's term is lower, reject
 	if req.Term < int64(r.currentTerm) {
 		log.Printf("[Raft %d] Rejected AppendEntries from leader %d: stale term %d < %d", r.serverId, req.LeaderId, req.Term, r.currentTerm)
 		return reply, nil
 	}
 
-	// If leader's term is higher, update our term and convert to follower
+	savedCurrentTerm := r.currentTerm
+	savedVotedFor := r.votedFor
+	savedLog := make([]LogEntry, len(r.log))
+	copy(savedLog, r.log)
+
+	needRollback := false
+
 	if req.Term > int64(r.currentTerm) {
 		log.Printf("[Raft %d] Received AppendEntries from leader %d with higher term %d, updating term", r.serverId, req.LeaderId, req.Term)
 		r.currentTerm = int(req.Term)
 		r.votedFor = -1
 		r.state = Follower
 		reply.Term = req.Term
+		needRollback = true
 	}
 
-	// Track the leader (valid AppendEntries with current or higher term)
 	if r.leaderId != int(req.LeaderId) {
 		log.Printf("[Raft %d] Discovered leader %d for term %d", r.serverId, req.LeaderId, req.Term)
 	}
 	r.leaderId = int(req.LeaderId)
 
-	// Reset election timer - we've received valid heartbeat/append from leader
 	r.resetElectionTimer()
 
-	// Check if prevLogIndex matches
-	// prevLogIndex of 0 means leader has no previous log entry (empty log)
 	if req.PrevLogIndex > 0 {
-		// Check if we have the entry at prevLogIndex
 		if int(req.PrevLogIndex) > len(r.log) {
-			// We don't have enough entries
 			log.Printf("[Raft %d] Log mismatch at index %d: don't have entry", r.serverId, req.PrevLogIndex)
 			return reply, nil
 		}
-		// Check if term matches at prevLogIndex (convert 1-based to 0-based array index)
 		if r.log[req.PrevLogIndex-1].Term != int(req.PrevLogTerm) {
-			// Log conflict - delete this and all following entries
 			log.Printf("[Raft %d] Log conflict at index %d: term %d != %d, truncating log", r.serverId, req.PrevLogIndex, r.log[req.PrevLogIndex-1].Term, req.PrevLogTerm)
 			r.log = r.log[:req.PrevLogIndex-1]
 			return reply, nil
 		}
 	}
 
-	// Append new entries
 	entriesAppended := 0
-	// logIndex is 1-based, so we convert to 0-based array index when accessing r.log
 	for i, entry := range req.Entries {
-		logIndex := int(req.PrevLogIndex) + i // 1-based index of where this entry should go
-		arrayIndex := logIndex - 1            // 0-based index in the array
+		logIndex := int(req.PrevLogIndex) + i
+		arrayIndex := logIndex - 1
 
 		if arrayIndex < len(r.log) {
-			// We have an entry at this index - check for conflict
 			if r.log[arrayIndex].Term != int(entry.Term) {
-				// Conflict found - delete this and all following entries
 				log.Printf("[Raft %d] Conflict at index %d: replacing term %d with %d", r.serverId, logIndex, r.log[arrayIndex].Term, entry.Term)
 				r.log = r.log[:arrayIndex]
-				// Append the new entry
 				r.log = append(r.log, LogEntry{
 					Index:   entry.Index,
 					Term:    int(entry.Term),
 					Command: entry.Command,
 				})
 				entriesAppended++
+				needRollback = true
 			}
-			// If terms match, entry is already there, skip
 		} else {
-			// Append new entry
 			r.log = append(r.log, LogEntry{
 				Index:   entry.Index,
 				Term:    int(entry.Term),
 				Command: entry.Command,
 			})
 			entriesAppended++
+			needRollback = true
 		}
 	}
 
 	if len(req.Entries) > 0 {
 		if entriesAppended > 0 {
-			log.Printf("[Raft %d] Appended %d/%d entries from leader (log size: %d)", r.serverId, entriesAppended, len(req.Entries), len(r.log))
+			r.debugLog("[Raft %d] Appended %d/%d entries from leader (log size: %d)", r.serverId, entriesAppended, len(req.Entries), len(r.log))
 		} else {
-			log.Printf("[Raft %d] All %d entries already present (heartbeat)", r.serverId, len(req.Entries))
+			r.debugLog("[Raft %d] All %d entries already present (heartbeat)", r.serverId, len(req.Entries))
 		}
 	}
 
-	// Update commitIndex if leaderCommit > commitIndex
-	// Note: logIndex is 1-based, commitIndex should also be 1-based
-	// SAFETY: Raft never commits log entries from previous terms by counting replicas.
-	// We only advance commitIndex if the entry at that index is from the current term.
 	oldCommitIndex := r.commitIndex
 	if req.LeaderCommit > int64(r.commitIndex) {
-		lastNewIndex := req.PrevLogIndex + int64(len(req.Entries)) // 1-based
+		lastNewIndex := req.PrevLogIndex + int64(len(req.Entries))
 		newCommitIndex := req.LeaderCommit
 		if req.LeaderCommit > lastNewIndex {
 			newCommitIndex = lastNewIndex
 		}
 
-		// Only commit entries from the current term
-		// Entries from previous terms can only be committed indirectly once
-		// an entry from the current term is committed (Log Matching Property)
 		for i := r.commitIndex + 1; i <= int(newCommitIndex); i++ {
-			arrayIndex := i - 1 // Convert to 0-based
+			arrayIndex := i - 1
 			if arrayIndex >= len(r.log) {
-				// Don't have this entry yet, stop here
 				break
 			}
 			if r.log[arrayIndex].Term != r.currentTerm {
-				// Entry is from a previous term, don't commit it yet
-				// Wait until leader commits an entry from current term
 				break
 			}
 			r.commitIndex = i
@@ -149,9 +132,18 @@ func (r *Raft) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) 
 		}
 	}
 
-	// Persist state before responding (Raft requirement)
-	if err := r.persist(); err != nil {
-		return nil, fmt.Errorf("failed to persist state: %w", err)
+	if needRollback {
+		r.mu.Unlock()
+		err := r.persister.Save(r.currentTerm, r.votedFor, r.log)
+		r.mu.Lock()
+
+		if err != nil {
+			log.Printf("[Raft %d] CRITICAL: Failed to persist state, rolling back: %v", r.serverId, err)
+			r.currentTerm = savedCurrentTerm
+			r.votedFor = savedVotedFor
+			r.log = savedLog
+			return nil, fmt.Errorf("failed to persist state: %w", err)
+		}
 	}
 
 	reply.Success = true
@@ -193,14 +185,22 @@ func (r *Raft) ReplicateCommand(cmd []byte) (int, error) {
 		return 0, fmt.Errorf("failed to persist: %w", err)
 	}
 
-	// Trigger immediate replication to all peers
+	// Collect peer IDs while holding lock, then spawn goroutines after releasing
+	peerIds := make([]int, 0, len(r.peers))
 	for peerId := range r.peers {
-		go r.sendAppendEntries(peerId)
+		peerIds = append(peerIds, peerId)
 	}
 
-	// Remember target index and release lock
+	// Remember target index
 	targetIndex := nextIndex
+
+	// Release lock BEFORE spawning goroutines to allow parallel execution
 	r.mu.Unlock()
+
+	// Spawn goroutines without holding lock - sendAppendEntries will acquire its own lock
+	for _, peerId := range peerIds {
+		go r.sendAppendEntries(peerId)
+	}
 
 	// Wait for commit with timeout (5 seconds)
 	log.Printf("[Raft %d] Waiting for command %d to commit...", r.serverId, targetIndex)
@@ -233,6 +233,15 @@ func (r *Raft) sendAppendEntries(peerId int) {
 	if !ok {
 		return
 	}
+
+	// Ensure connection is healthy
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	if err := peer.ensureConnected(connectCtx); err != nil {
+		connectCancel()
+		log.Printf("[Raft %d] Cannot reach peer %d: %v", r.serverId, peerId, err)
+		return
+	}
+	connectCancel()
 
 	r.mu.Lock()
 	if r.state != Leader {
@@ -274,8 +283,8 @@ func (r *Raft) sendAppendEntries(peerId int) {
 	}
 	r.mu.Unlock()
 
-	// Make RPC call with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// Make RPC call with timeout (heartbeat should be fast)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
 	reply, err := peer.raftClient.AppendEntries(ctx, args)
@@ -287,10 +296,10 @@ func (r *Raft) sendAppendEntries(peerId int) {
 
 	// Handle response
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	// Check if we're still leader and term hasn't changed
 	if r.state != Leader || r.currentTerm != int(args.Term) {
+		r.mu.Unlock()
 		return
 	}
 
@@ -298,6 +307,7 @@ func (r *Raft) sendAppendEntries(peerId int) {
 	if reply.Term > int64(r.currentTerm) {
 		log.Printf("[Raft %d] Peer %d has higher term %d, stepping down", r.serverId, peerId, reply.Term)
 		r.stepDown(int(reply.Term))
+		r.mu.Unlock()
 		return
 	}
 
@@ -306,19 +316,21 @@ func (r *Raft) sendAppendEntries(peerId int) {
 		newMatchIndex := prevLogIndex + len(entries)
 		if newMatchIndex > peer.matchIndex {
 			peer.matchIndex = newMatchIndex
-			log.Printf("[Raft %d] Peer %d replicated up to index %d", r.serverId, peerId, peer.matchIndex)
+			r.debugLog("[Raft %d] Peer %d replicated up to index %d", r.serverId, peerId, peer.matchIndex)
 		}
 		peer.nextIndex = peer.matchIndex + 1
 
 		// Try to advance commit index
 		r.updateCommitIndex()
+		r.mu.Unlock()
 	} else {
 		// Log mismatch - decrement nextIndex and retry
-		log.Printf("[Raft %d] Peer %d rejected AppendEntries (log mismatch), retrying with nextIndex=%d", r.serverId, peerId, peer.nextIndex-1)
+		r.debugLog("[Raft %d] Peer %d rejected AppendEntries (log mismatch), retrying with nextIndex=%d", r.serverId, peerId, peer.nextIndex-1)
 		if peer.nextIndex > 1 {
 			peer.nextIndex--
 		}
-		// Trigger immediate retry
+		r.mu.Unlock()
+		// Spawn retry goroutine AFTER releasing lock
 		go r.sendAppendEntries(peerId)
 	}
 }
