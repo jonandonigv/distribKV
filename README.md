@@ -13,23 +13,32 @@ distribKV provides a fault-tolerant, strongly consistent key-value store through
 - ✅ Crash recovery with state persistence
 - ✅ Key-Value service layer (Put/Get/Append)
 - ✅ Client library with automatic retry and leader discovery
-- ✅ gRPC-based communication
+- ✅ gRPC-based communication with keepalive
+- ✅ Stable cluster operation (tested 2+ minutes continuous operation)
 - 🔄 Log compaction via snapshotting (planned)
 
 ## Current Implementation Status
 
-### ✅ Completed
+### ✅ Stable - Production Ready
 
 **Core Raft**
 - Randomized timeouts (150-300ms)
 - Vote counting with proper mutex protection
 - Timer reset on valid leader communication
 - Election safety: only one leader per term
+- **Election backoff for failed elections** (prevents thrashing)
+- **Proper election tracking with pending RPC counting**
 - Heartbeat sender (50ms intervals)
 - AppendEntries RPC with log matching
 - Conflict detection and log truncation
 - nextIndex/matchIndex tracking per peer
 - Automatic retry on mismatch
+
+**gRPC & Networking**
+- **Keepalive configuration (10s ping, 3s timeout)**
+- **Connection state checking before RPCs**
+- **Reduced RPC timeouts (500ms RequestVote, 1s AppendEntries)**
+- Health check service
 
 **Persistence Layer**
 - JSON format with base64 encoding
@@ -47,7 +56,6 @@ distribKV provides a fault-tolerant, strongly consistent key-value store through
 - Duplicate detection and caching (100 entries or 10s per client)
 - Leader tracking and hints
 - Thread-safe concurrent operations
-- 5-second RPC timeout with retry
 
 **Client Library (Clerk)**
 - Automatic leader discovery
@@ -246,6 +254,8 @@ go test -race -cover ./...
 distribKV/
 ├── cmd/
 │   ├── kvserver/             # Main KV server binary
+│   │   └── main.go
+│   ├── kv-client/            # KV cluster test client
 │   │   └── main.go
 │   ├── grpc-test-server/     # gRPC Health Check server (testing)
 │   │   └── main.go
@@ -454,15 +464,16 @@ The Clerk is safe for concurrent use:
 2. **Phase 2**: Log Replication - Replicate client commands across cluster
 3. **Phase 3**: Persistence - Crash recovery using persistent storage
 4. **Phase 4**: Key-Value Service - Build KV store on top of Raft
+5. **Phase 5**: Stability - Fixed election thrashing, gRPC keepalive, connection management
 
 ### 🔄 Current / Next
 
-5. **Phase 5**: Snapshotting - Log compaction and faster recovery
+6. **Phase 6**: Snapshotting - Log compaction and faster recovery
    - InstallSnapshot RPC
    - Log truncation
    - State machine snapshots
 
-6. **Phase 6**: Production Hardening
+7. **Phase 7**: Production Hardening
    - Comprehensive test suite
    - Metrics and monitoring
    - Configuration management
