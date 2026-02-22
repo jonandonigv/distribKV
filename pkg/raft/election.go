@@ -41,6 +41,10 @@ func (r *Raft) runElectionTimer() {
 			case <-doneChan:
 				// All RPCs completed - start new election immediately
 				timer.Stop()
+				r.mu.Lock()
+				r.electionDoneChan = nil
+				r.consecutiveFailedElections++
+				r.mu.Unlock()
 				log.Printf("[Raft %d] Election completed without majority, starting new election", r.serverId)
 				r.becomeCandidate()
 
@@ -90,6 +94,21 @@ func (r *Raft) runElectionTimer() {
 // It increments the term, votes for itself, resets the election timer, and sends
 // RequestVote RPCs to all peers concurrently.
 func (r *Raft) becomeCandidate() {
+	// Apply backoff if we've had consecutive failed elections
+	r.mu.Lock()
+	failedCount := r.consecutiveFailedElections
+	r.mu.Unlock()
+
+	if failedCount > 0 {
+		backoff := time.Duration(rand.Intn(300))*time.Millisecond +
+			time.Duration(failedCount*150)*time.Millisecond
+		if backoff > 3*time.Second {
+			backoff = 3 * time.Second
+		}
+		r.debugLog("[Raft %d] Backing off for %v after %d failed elections", r.serverId, backoff, failedCount)
+		time.Sleep(backoff)
+	}
+
 	r.mu.Lock()
 
 	// Only become candidate if we're a follower or candidate
@@ -147,7 +166,6 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 			r.mu.Lock()
 			if r.electionDoneChan != nil {
 				close(r.electionDoneChan)
-				r.electionDoneChan = nil
 			}
 			r.mu.Unlock()
 		}
@@ -256,6 +274,9 @@ func (r *Raft) stepDown(newTerm int) {
 		r.electionDoneChan = nil
 	}
 
+	// Reset failed election counter - we found a leader
+	r.consecutiveFailedElections = 0
+
 	log.Printf("[Raft %d] State change: %v -> Follower (term %d)", r.serverId, oldState, newTerm)
 	r.resetElectionTimer()
 }
@@ -295,6 +316,9 @@ func (r *Raft) becomeLeader() {
 	log.Printf("[Raft %d] *** ELECTED LEADER (term %d) ***", r.serverId, r.currentTerm)
 	r.state = Leader
 	r.leaderId = r.serverId // Self-aware: track self as leader
+
+	// Reset failed election counter - we won!
+	r.consecutiveFailedElections = 0
 
 	// Clear election tracking (we won, no need for electionDoneChan)
 	r.electionDoneChan = nil

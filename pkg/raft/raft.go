@@ -61,8 +61,9 @@ type Raft struct {
 	deterministicTimeout    time.Duration
 
 	// Election coordination
-	pendingVoteRpcs  int32
-	electionDoneChan chan struct{}
+	pendingVoteRpcs            int32
+	electionDoneChan           chan struct{}
+	consecutiveFailedElections int
 
 	// Vote counting (only used during candidacy)
 	votesReceived int
