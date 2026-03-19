@@ -7,6 +7,7 @@ A distributed key-value store built with the Raft consensus algorithm in Go. Whi
 distribKV provides a fault-tolerant, strongly consistent key-value store through Raft consensus. All nodes agree on the order of operations, ensuring linearizability even during network partitions and node failures.
 
 **Key Features:**
+
 - ✅ Raft consensus for leader election and log replication
 - ✅ Strong consistency (linearizable reads/writes)
 - ✅ Fault tolerance with automatic leader election
@@ -22,6 +23,7 @@ distribKV provides a fault-tolerant, strongly consistent key-value store through
 ### ✅ Stable - Production Ready
 
 **Core Raft**
+
 - Randomized timeouts (150-300ms)
 - Vote counting with proper mutex protection
 - Timer reset on valid leader communication
@@ -35,29 +37,34 @@ distribKV provides a fault-tolerant, strongly consistent key-value store through
 - Automatic retry on mismatch
 
 **gRPC & Networking**
+
 - **Keepalive configuration (10s ping, 3s timeout)**
 - **Connection state checking before RPCs**
 - **Reduced RPC timeouts (500ms RequestVote, 1s AppendEntries)**
 - Health check service
 
 **Persistence Layer**
+
 - JSON format with base64 encoding
 - Atomic writes (temp file + fsync + rename)
 - Automatic state recovery on startup
 - Data directory: `./data/raft-state.json`
 
 **State Machine Integration**
+
 - Apply channel for committed entries
 - Background apply goroutine
 - Proper lastApplied tracking
 
 **Key-Value Service**
+
 - Get, Put, Append operations
 - Duplicate detection and caching (100 entries or 10s per client)
 - Leader tracking and hints
 - Thread-safe concurrent operations
 
 **Client Library (Clerk)**
+
 - Automatic leader discovery
 - Exponential backoff retry (50ms → 1s)
 - Sequence numbers for exactly-once semantics
@@ -67,6 +74,7 @@ distribKV provides a fault-tolerant, strongly consistent key-value store through
 ### 🔄 In Progress / Planned
 
 **Future Work**
+
 - Log compaction and snapshotting
 - Comprehensive test suite
 - Production deployment hardening
@@ -109,6 +117,7 @@ distribKV provides a fault-tolerant, strongly consistent key-value store through
 ### Consensus & Raft
 
 Raft is a consensus algorithm that allows multiple servers to agree on values. Once they reach a decision, that decision is final. Raft provides:
+
 - **Leader Election** - Distributed algorithm to elect a unique leader
 - **Log Replication** - Leader replicates commands to followers
 - **Safety** - At most one leader per term, logs match safety property
@@ -117,6 +126,7 @@ Raft is a consensus algorithm that allows multiple servers to agree on values. O
 ### CAP Theorem
 
 In any distributed data store, you can only provide two of three guarantees:
+
 - **Consistency** - All nodes see the same data at the same time
 - **Availability** - Every request receives a response
 - **Partition Tolerance** - System continues despite network failures
@@ -126,6 +136,7 @@ When a network partition occurs, you must choose between consistency or availabi
 ### Linearizability
 
 Linearizability provides the illusion that:
+
 - There's only one copy of the data
 - Operations execute one at a time
 - The system has a global, instantaneous order of operations
@@ -176,6 +187,7 @@ The easiest way to run a cluster is using the provided scripts:
 ```
 
 The startup script will:
+
 - Start all 3 servers simultaneously
 - Create separate data directories for each node
 - Show server status and log locations
@@ -199,6 +211,7 @@ If you prefer to start servers individually:
 **Note:** When starting manually, you must start all 3 servers simultaneously (within ~1 second) because the Raft layer requires all peers to be reachable at startup.
 
 **Server Options:**
+
 - `-id` - Server ID (optional, derived from port if not specified)
 - `-peers` - Comma-separated list of peer addresses (required)
 - `-port` - Port to listen on (default: 10000 + id)
@@ -225,10 +238,10 @@ func main() {
 
     // Store a value
     ck.Put("greeting", "Hello")
-    
+
     // Append to it
     ck.Append("greeting", " World")
-    
+
     // Retrieve the value
     value := ck.Get("greeting")
     fmt.Println(value) // Output: Hello World
@@ -317,7 +330,7 @@ import "github.com/jonandonigv/distribKV/pkg/kvserver"
 // Create clerk connected to all servers
 ck := kvserver.MakeClerk([]string{
     "localhost:10001",
-    "localhost:10002", 
+    "localhost:10002",
     "localhost:10003",
 }, false) // verbose=false for production
 ```
@@ -412,7 +425,7 @@ applyCh := r.GetApplyCh()
 // Read committed commands
 for msg := range applyCh {
     if msg.CommandValid {
-        fmt.Printf("Applying command at index %d: %v\n", 
+        fmt.Printf("Applying command at index %d: %v\n",
             msg.CommandIndex, msg.Command)
     }
 }
@@ -423,6 +436,7 @@ for msg := range applyCh {
 ### Duplicate Detection
 
 The KV server tracks completed operations using (clientId, sequenceNum) pairs:
+
 - Cache size: 100 entries per client
 - Expiration: 10 seconds
 - Eviction: FIFO when limit reached
@@ -432,6 +446,7 @@ This ensures exactly-once semantics even with client retries.
 ### Leader Discovery
 
 The Clerk maintains a leader cache:
+
 - Tries cached leader first for optimization
 - Updates cache on wrong_leader responses
 - Falls back to round-robin if leader unknown
@@ -440,6 +455,7 @@ The Clerk maintains a leader cache:
 ### Retry Strategy
 
 All operations use exponential backoff:
+
 - Attempt 1: 50ms
 - Attempt 2: 100ms
 - Attempt 3: 200ms
@@ -452,53 +468,10 @@ Maximum 1000 attempts before panic (indicates total cluster failure).
 ### Thread Safety
 
 The Clerk is safe for concurrent use:
+
 - Sequence numbers use mutex protection
 - Leader cache updates are atomic
 - Multiple goroutines can share one Clerk instance
-
-## Learning Phases
-
-### ✅ Completed
-
-1. **Phase 1**: Raft Foundation - Leader election and heartbeats
-2. **Phase 2**: Log Replication - Replicate client commands across cluster
-3. **Phase 3**: Persistence - Crash recovery using persistent storage
-4. **Phase 4**: Key-Value Service - Build KV store on top of Raft
-5. **Phase 5**: Stability - Fixed election thrashing, gRPC keepalive, connection management
-
-### 🔄 Current / Next
-
-6. **Phase 6**: Snapshotting - Log compaction and faster recovery
-   - InstallSnapshot RPC
-   - Log truncation
-   - State machine snapshots
-
-7. **Phase 7**: Production Hardening
-   - Comprehensive test suite
-   - Metrics and monitoring
-   - Configuration management
-   - Deployment tooling
-
-## Resources
-
-### Required Reading
-- [Raft Paper](https://raft.github.io/raft.pdf) - Sections 2, 3, 4, 5, 7
-- [MIT 6.824 Raft Lab](https://pdos.csail.mit.edu/6.824/labs/lab-raft.html)
-- [Raft Visualization](https://raft.github.io/)
-
-### Reference Implementations
-- [Etcd's Raft library](https://github.com/etcd-io/etcd/tree/main/server/etcdserver/api/raft)
-- [HashiCorp Raft](https://github.com/hashicorp/raft)
-
-## Contributing
-
-This project is being developed with production deployment as a goal. Follow the guidelines in [AGENTS.md](./AGENTS.md) for code style and testing.
-
-When making changes:
-1. Test with the KV server and Clerk
-2. Verify multi-node scenarios work correctly
-3. Ensure graceful shutdown on signals
-4. Run tests with race detector: `go test -race ./...`
 
 ## License
 
