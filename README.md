@@ -27,55 +27,7 @@ In distributed systems, making multiple servers agree on state is notoriously di
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      CLIENT APPLICATION                      │
-│                                                              │
-│   ck.Get("user:123")                                        │
-│   ck.Put("config:timeout", "30s")                           │
-│   ck.Append("log:events", "new event")                      │
-│                                                              │
-└──────────────────────┬──────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                         CLERK (Client)                       │
-│                                                              │
-│  • Automatic leader discovery & caching                     │
-│  • Exponential backoff retry (50ms → 1s, max 1000 attempts) │
-│  • Sequence numbers for exactly-once semantics              │
-│  • Persistent gRPC connections with health checks           │
-│                                                              │
-└──────────────────────┬──────────────────────────────────────┘
-                       │ gRPC (Keepalive: 10s ping, 3s timeout)
-                       ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      KV CLUSTER (3-5 nodes)                  │
-│                                                              │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐     │
-│  │  Server 1   │◄──►│  Server 2   │◄──►│  Server 3   │     │
-│  │  (Leader)   │    │ (Follower)  │    │ (Follower)  │     │
-│  │             │    │             │    │             │     │
-│  │  ┌───────┐  │    │  ┌───────┐  │    │  ┌───────┐  │     │
-│  │  │  KV   │  │    │  │  KV   │  │    │  │  KV   │  │     │
-│  │  │ State │  │    │  │ State │  │    │  │ State │  │     │
-│  │  │Machine│  │    │  │Machine│  │    │  │Machine│  │     │
-│  │  └───┬───┘  │    │  └───┬───┘  │    │  └───┬───┘  │     │
-│  │      │      │    │      │      │    │      │      │     │
-│  │  ┌───▼───┐  │    │  ┌───▼───┐  │    │  ┌───▼───┐  │     │
-│  │  │ Raft  │◄─┼────┼──► Raft │◄─┼────┼──► Raft │  │     │
-│  │  │Consensus  │    │  │Consensus  │    │  │Consensus  │     │
-│  │  │ Layer │  │    │  │ Layer │  │    │  │ Layer │  │     │
-│  │  └──┬────┘  │    │  └──┬────┘  │    │  └──┬────┘  │     │
-│  │     │       │    │     │       │    │     │       │     │
-│  │  ┌──▼────┐  │    │  ┌──▼────┐  │    │  ┌──▼────┐  │     │
-│  │  │Persistence  │    │  │Persistence  │    │  │Persistence  │     │
-│  │  │(JSON + fsync)   │    │  │(JSON + fsync)   │    │  │(JSON + fsync)   │     │
-│  │  └───────┘  │    │  └───────┘  │    │  └───────┘  │     │
-│  └─────────────┘    └─────────────┘    └─────────────┘     │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
+![distribKV Architecture](Architecture.png)
 
 ### Two-Layer Design
 
