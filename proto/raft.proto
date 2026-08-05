@@ -1,0 +1,78 @@
+syntax = "proto3";
+
+package distribkv.raft;
+
+option go_package = "github.com/jonandonigv/distribKV/raft;raft";
+
+// Raft implements the consensus algorithm peer-to-peer RPCs.
+// Per Raft paper sections 3-5 plus the InstallSnapshot RPC from section 7.
+//
+// Field conventions (see AGENTS.md):
+//   - int32 for ids and peer indices
+//   - int64 for log indexes and terms
+service Raft {
+  // RequestVote is sent by candidates to gather votes (Section 5.2).
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+
+  // AppendEntries is used both for heartbeats and for log replication
+  // (Section 5.3).
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+  // InstallSnapshot is sent by the leader to a follower that is too far
+  // behind to be caught up via AppendEntries. Snapshotting is not
+  // implemented in 0.1.0; the handler returns codes.Unimplemented so the
+  // RPC is part of the schema from day one. (Section 7)
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
+}
+
+// LogEntry is one entry in the replicated log. Index is the absolute Raft
+// index (1-indexed in Raft terms, but stored as int64 here so it composes
+// cleanly with logBase arithmetic in the consumer).
+message LogEntry {
+  int64 index = 1;
+  int64 term = 2;
+  bytes command = 3; // opaque payload; kv.Command serialized by callers
+}
+
+message RequestVoteRequest {
+  int64 term = 1;            // candidate's term
+  int32 candidate_id = 2;    // candidate requesting vote
+  int64 last_log_index = 3; // index of candidate's last log entry
+  int64 last_log_term = 4;  // term of candidate's last log entry
+}
+
+message RequestVoteResponse {
+  int64 term = 1;          // currentTerm, for candidate to update itself
+  bool vote_granted = 2;   // true means candidate received vote
+}
+
+message AppendEntriesRequest {
+  int64 term = 1;            // leader's term
+  int32 leader_id = 2;       // so follower can redirect clients
+  int64 prev_log_index = 3;  // index of log entry immediately preceding new ones
+  int64 prev_log_term = 4;   // term of prev_log_index entry
+  repeated LogEntry entries = 5; // log entries to store (empty for heartbeat)
+  int64 leader_commit = 6;   // leader's commitIndex
+}
+
+message AppendEntriesResponse {
+  int64 term = 1;     // currentTerm, for leader to update itself
+  bool success = 2;   // true if follower contained entry matching prev_log
+}
+
+// InstallSnapshot messages. Snapshotting is not implemented in 0.1.0; these
+// shapes are declared for schema stability. The Raft handler returns
+// codes.Unimplemented until the snapshot phase.
+message InstallSnapshotRequest {
+  int64 term = 1;                   // leader's term
+  int32 leader_id = 2;              // so follower can redirect clients
+  int64 last_included_index = 3;    // snapshot replaces all entries up to here
+  int64 last_included_term = 4;     // term of last_included_index
+  int64 offset = 5;                 // byte offset where chunk begins
+  bytes data = 6;                   // snapshot chunk (single chunk for 0.1.x)
+  bool done = 7;                    // true if this is the last chunk
+}
+
+message InstallSnapshotResponse {
+  int64 term = 1; // currentTerm, for leader to update itself
+}
