@@ -85,6 +85,10 @@ type Raft struct {
 
 	// Debug mode for verbose logging
 	debug bool
+
+	// Lifecycle
+	shutdown bool
+	wg       sync.WaitGroup
 }
 
 // ApplyMsg is sent to the application (KV service) when a log entry is committed.
@@ -121,6 +125,38 @@ func deriveIdFromAddress(address string) int {
 }
 
 func NewRaft(serverId int, peerAddresses []string, dataDir string, connectCtx context.Context) (*Raft, error) {
+	// Build id -> address map from the flat address list.
+	// Each address derives its id via deriveIdFromAddress (port % 10000),
+	// matching the legacy behavior used by cmd/kvserver.
+	peerAddrs := make(map[int]string)
+	for _, addr := range peerAddresses {
+		peerId := deriveIdFromAddress(addr)
+		if peerId == 0 {
+			continue
+		}
+		peerAddrs[peerId] = addr
+	}
+
+	rf, err := NewRaftWithPeers(serverId, peerAddrs, dataDir, connectCtx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Legacy auto-connect: connect to all peers up front.
+	if err := rf.ConnectPeers(connectCtx); err != nil {
+		return nil, err
+	}
+	return rf, nil
+}
+
+// NewRaftWithPeers constructs a Raft node using an explicit id->address map.
+// The map MUST include this node's own id mapped to its own address; that
+// entry is used to set r.address and is not added as a peer. No automatic
+// peer connection attempt is performed: callers (or the election/heartbeat
+// loops' lazy ensureConnected) are expected to dial peers as needed. This
+// constructor is the testable seam that allows in-process gRPC clusters on
+// ephemeral ports with deterministic ids.
+func NewRaftWithPeers(serverId int, peerAddrs map[int]string, dataDir string, connectCtx context.Context) (*Raft, error) {
 	r := &Raft{
 		serverId:                serverId,
 		peers:                   make(map[int]*Peer),
@@ -136,8 +172,7 @@ func NewRaft(serverId int, peerAddresses []string, dataDir string, connectCtx co
 		heartbeatInterval:       50 * time.Millisecond,
 	}
 
-	for _, addr := range peerAddresses {
-		peerId := deriveIdFromAddress(addr)
+	for peerId, addr := range peerAddrs {
 		if peerId == 0 {
 			continue
 		}
@@ -153,11 +188,6 @@ func NewRaft(serverId int, peerAddresses []string, dataDir string, connectCtx co
 			matchIndex:  0,
 			lastContact: time.Time{},
 		}
-	}
-
-	// Establish connections to all peers
-	if err := r.ConnectPeers(connectCtx); err != nil {
-		return nil, err
 	}
 
 	// Initialize persister and load persisted state
@@ -179,6 +209,7 @@ func NewRaft(serverId int, peerAddresses []string, dataDir string, connectCtx co
 	r.applyCond = sync.NewCond(&r.mu)
 
 	// Start apply goroutine
+	r.wg.Add(1)
 	go r.applyCommittedEntries()
 
 	return r, nil
@@ -325,9 +356,59 @@ func isConnectionError(err error) bool {
 // Start initializes and starts the election timer goroutine.
 // Must be called after NewRaft() to begin the election process.
 func (r *Raft) Start() {
+	r.mu.Lock()
 	r.electionResetChan = make(chan struct{}, 10)
 	r.electionStopChan = make(chan struct{})
-	go r.runElectionTimer()
+	resetCh := r.electionResetChan
+	stopCh := r.electionStopChan
+	r.mu.Unlock()
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.runElectionTimer(resetCh, stopCh)
+	}()
+}
+
+// Shutdown stops all background goroutines (election timer, heartbeat sender,
+// apply loop) and waits for them to exit. It also closes any peer gRPC
+// connections so in-flight RPCs fail fast. Safe to call multiple times.
+//
+// Shutdown does not unregister the node from its gRPC server; callers (or the
+// test harness) are responsible for stopping the gRPC server as well.
+func (r *Raft) Shutdown() {
+	r.mu.Lock()
+	if r.shutdown {
+		r.mu.Unlock()
+		return
+	}
+	r.shutdown = true
+
+	if r.electionStopChan != nil {
+		close(r.electionStopChan)
+		r.electionStopChan = nil
+	}
+	if r.heartbeatStopChan != nil {
+		close(r.heartbeatStopChan)
+		r.heartbeatStopChan = nil
+	}
+
+	// Wake the apply goroutine and any replication waiters so they observe
+	// the shutdown flag.
+	r.applyCond.Broadcast()
+	r.replicationCond.Broadcast()
+
+	// Close peer gRPC clients so in-flight RPCs error out promptly.
+	for _, peer := range r.peers {
+		if peer.client != nil {
+			_ = peer.client.Close()
+			peer.client = nil
+			peer.raftClient = nil
+		}
+	}
+	r.mu.Unlock()
+
+	r.wg.Wait()
 }
 
 // SetDeterministicTimeout sets a fixed timeout for testing purposes.
@@ -373,12 +454,18 @@ func (r *Raft) majorityCount() int {
 // applyCommittedEntries is a background goroutine that applies committed log entries
 // to the state machine. It runs continuously and sends applied entries via applyCh.
 func (r *Raft) applyCommittedEntries() {
+	defer r.wg.Done()
 	for {
 		r.mu.Lock()
 
-		// Wait until there are entries to apply
-		for r.lastApplied >= r.commitIndex {
+		// Wait until there are entries to apply or we are shutting down.
+		for !r.shutdown && r.lastApplied >= r.commitIndex {
 			r.applyCond.Wait()
+		}
+
+		if r.shutdown {
+			r.mu.Unlock()
+			return
 		}
 
 		// Get entries to apply
@@ -393,6 +480,16 @@ func (r *Raft) applyCommittedEntries() {
 
 		// Apply entries outside of lock
 		for _, entry := range entriesToApply {
+			// Re-check shutdown before each blocking send so that Shutdown
+			// can interrupt a long burst when the applyCh consumer has gone
+			// away.
+			r.mu.Lock()
+			if r.shutdown {
+				r.mu.Unlock()
+				return
+			}
+			r.mu.Unlock()
+
 			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,

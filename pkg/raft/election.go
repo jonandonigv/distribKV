@@ -14,7 +14,9 @@ import (
 // runElectionTimer is the background goroutine that manages election timeouts.
 // It uses a select statement to handle timer expiration, reset signals, and stop signals.
 // When the timer expires, it triggers a new election by calling becomeCandidate().
-func (r *Raft) runElectionTimer() {
+// resetCh and stopCh are captured at Start() time so reads in the select are
+// race-free against Shutdown closing/resetting the channel fields on r.
+func (r *Raft) runElectionTimer(resetCh, stopCh chan struct{}) {
 	for {
 		// Calculate timeout duration
 		var timeout time.Duration
@@ -48,17 +50,17 @@ func (r *Raft) runElectionTimer() {
 				log.Printf("[Raft %d] Election completed without majority, starting new election", r.serverId)
 				r.becomeCandidate()
 
-			case <-r.electionResetChan:
+			case <-resetCh:
 				// Reset requested - drain any additional reset signals and continue
 				timer.Stop()
 				select {
-				case <-r.electionResetChan:
+				case <-resetCh:
 					// Drain additional resets
 				default:
 				}
 				continue
 
-			case <-r.electionStopChan:
+			case <-stopCh:
 				// Stop requested - exit goroutine
 				timer.Stop()
 				return
@@ -71,17 +73,17 @@ func (r *Raft) runElectionTimer() {
 				log.Printf("[Raft %d] Election timeout fired (no heartbeat), starting election", r.serverId)
 				r.becomeCandidate()
 
-			case <-r.electionResetChan:
+			case <-resetCh:
 				// Reset requested - drain any additional reset signals and continue
 				timer.Stop()
 				select {
-				case <-r.electionResetChan:
+				case <-resetCh:
 					// Drain additional resets
 				default:
 				}
 				continue
 
-			case <-r.electionStopChan:
+			case <-stopCh:
 				// Stop requested - exit goroutine
 				timer.Stop()
 				return
@@ -111,6 +113,12 @@ func (r *Raft) becomeCandidate() {
 
 	r.mu.Lock()
 
+	// Don't start a new election if we are shutting down.
+	if r.shutdown {
+		r.mu.Unlock()
+		return
+	}
+
 	// Only become candidate if we're a follower or candidate
 	// (we might have already become leader or stepped down)
 	if r.state == Leader {
@@ -132,6 +140,17 @@ func (r *Raft) becomeCandidate() {
 	r.votesReceived = 1
 	r.votesMutex.Unlock()
 
+	// Single-node cluster: the self-vote is a majority. Promote directly to
+	// Leader without dispatching any RPCs. (becomeLeader acquires r.mu itself,
+	// so release it first.)
+	if len(r.peers) == 0 {
+		term := r.currentTerm
+		r.mu.Unlock()
+		r.debugLog("[Raft %d] Single-node cluster: self-electing leader for term %d", r.serverId, term)
+		r.becomeLeader()
+		return
+	}
+
 	// Initialize election tracking
 	r.pendingVoteRpcs = int32(len(r.peers))
 	r.electionDoneChan = make(chan struct{})
@@ -144,12 +163,6 @@ func (r *Raft) becomeCandidate() {
 	r.resetElectionTimer()
 
 	r.debugLog("[Raft %d] Sending RequestVote to %d peers (term %d)", r.serverId, len(r.peers), term)
-
-	// Handle edge case: no peers (single-node cluster)
-	if len(r.peers) == 0 {
-		close(r.electionDoneChan)
-		return
-	}
 
 	// Send RequestVote to all peers concurrently
 	for peerId := range r.peers {
@@ -293,12 +306,13 @@ func (r *Raft) resetElectionTimer() {
 }
 
 // stopElectionTimer sends a signal to stop the election timer goroutine.
+// Idempotent. Caller MUST hold r.mu. Shutdown closes the channel inline
+// rather than calling this helper (since the election timer is started
+// outside the lock and reads a captured local).
 func (r *Raft) stopElectionTimer() {
-	select {
-	case <-r.electionStopChan:
-		// Already closed
-	default:
+	if r.electionStopChan != nil {
 		close(r.electionStopChan)
+		r.electionStopChan = nil
 	}
 }
 
@@ -400,26 +414,29 @@ func (r *Raft) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb
 }
 
 // startHeartbeat initializes and starts the heartbeat sender goroutine.
-// Must be called when node becomes leader.
+// Must be called when node becomes leader. Caller MUST hold r.mu.
 func (r *Raft) startHeartbeat() {
-	r.heartbeatStopChan = make(chan struct{})
-	go r.runHeartbeat()
+	stopCh := make(chan struct{})
+	r.heartbeatStopChan = stopCh
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.runHeartbeat(stopCh)
+	}()
 }
 
 // stopHeartbeat signals the heartbeat sender goroutine to stop.
-// Must be called when leader steps down.
+// Must be called when leader steps down. Caller MUST hold r.mu. Idempotent.
 func (r *Raft) stopHeartbeat() {
-	select {
-	case <-r.heartbeatStopChan:
-		// Already closed
-	default:
+	if r.heartbeatStopChan != nil {
 		close(r.heartbeatStopChan)
+		r.heartbeatStopChan = nil
 	}
 }
 
 // runHeartbeat is the background goroutine that sends periodic heartbeats to all peers.
-// It runs until stopHeartbeat is called.
-func (r *Raft) runHeartbeat() {
+// It runs until stopCh is closed or it notices the node is no longer leader.
+func (r *Raft) runHeartbeat(stopCh chan struct{}) {
 	log.Printf("[Raft %d] Heartbeat sender started (interval: %v)", r.serverId, r.heartbeatInterval)
 	ticker := time.NewTicker(r.heartbeatInterval)
 	defer ticker.Stop()
@@ -429,7 +446,7 @@ func (r *Raft) runHeartbeat() {
 		case <-ticker.C:
 			// Send heartbeat to all peers
 			r.mu.Lock()
-			if r.state != Leader {
+			if r.state != Leader || r.shutdown {
 				log.Printf("[Raft %d] Heartbeat sender stopping: no longer leader", r.serverId)
 				r.mu.Unlock()
 				return
@@ -440,7 +457,7 @@ func (r *Raft) runHeartbeat() {
 				go r.sendAppendEntries(peerId)
 			}
 
-		case <-r.heartbeatStopChan:
+		case <-stopCh:
 			log.Printf("[Raft %d] Heartbeat sender stopped", r.serverId)
 			return
 		}
