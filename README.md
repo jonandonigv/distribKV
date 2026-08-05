@@ -1,235 +1,138 @@
 # distribKV
 
-> **Production-grade Distributed Key-Value Store implementing the Raft consensus algorithm in Go**
+> A portfolio project: building a distributed key-value store on top of the Raft consensus algorithm, from scratch in Go.
 
-[![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://golang.org/)
-[![gRPC](https://img.shields.io/badge/gRPC-1.78-244c5a?style=flat)](https://grpc.io/)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+## Why this project
 
-**~2,500 LOC | Full Raft Implementation | Fault-Tolerant | Linearizable**
+Most backend work hides the hard parts of distributed systems behind a managed database. This project surfaces them. The goal is to understand — by implementing — how systems like etcd, Consul, and TiKV stay consistent and available when networks fail, clocks drift, and nodes crash.
 
----
+It is built as a learning-focused portfolio piece following the [MIT 6.824 Distributed Systems](https://pdos.csail.mit.edu/6.824/) progression, with production-grade engineering practices on top: table-driven tests, the `-race` detector, atomic persistence, clean shutdown semantics, and config-driven deployment.
 
-## What is distribKV?
+## What it demonstrates
 
-distribKV is a distributed key-value store that demonstrates how production systems like **etcd**, **Consul**, and **TiKV** achieve fault tolerance and strong consistency. Built from scratch in Go, it implements the [Raft consensus algorithm](https://raft.github.io/) to ensure all nodes in a cluster agree on every operation—even during network partitions and node failures.
-
-### The Problem It Solves
-
-In distributed systems, making multiple servers agree on state is notoriously difficult. Network delays, crashes, and partitions can cause replicas to diverge. distribKV solves this through:
-
-- **Consensus**: Raft ensures all nodes agree on the order of operations
-- **Fault Tolerance**: Automatic leader election when nodes fail
-- **Strong Consistency**: Linearizable reads and writes (as if there's only one copy of the data)
-- **Crash Recovery**: Persistent state survives restarts
-
----
+- **Consensus algorithms** — leader election, log replication, and the safety invariants of Raft
+- **Fault tolerance** — crash recovery via persistent state, partition handling, automatic re-election
+- **Strong consistency** — linearizable reads and writes through a replicated log
+- **Go concurrency** — goroutines, channels, `sync.Mutex`, `context.Context`, the race detector
+- **gRPC / Protocol Buffers** — typed RPCs, keepalive, health checks
+- **Systems design** — clean lifecycle (startup, shutdown, restart), configuration, deployment
 
 ## Architecture
 
 ![distribKV Architecture](Architecture.png)
 
-### Two-Layer Design
+### Two-layer design
 
-**1. Raft Consensus Layer** (`pkg/raft/`)
+**1. Raft consensus layer** (`raft/`)
 
-- Leader election with randomized timeouts (150-300ms)
-- Log replication with conflict detection
-- State persistence (atomic writes with fsync)
-- Apply channel for state machine integration
+- Leader election with randomized timeouts (150–300ms from config)
+- Log replication with conflict detection and `nextIndex`/`matchIndex` tracking
+- State persistence (atomic temp-file + `f.Sync()` + `os.Rename`)
+- Three background goroutines per node (election timer, heartbeat sender, apply loop), cleanly shut down via `context.Context` cancellation
+- `ApplyMsg` channel for state-machine integration
 
-**2. Key-Value Service Layer** (`pkg/kvserver/`)
+**2. Key-value service layer** (`kv/`)
 
-- Get/Put/Append operations through Raft
-- Duplicate detection (100-entry cache per client, 10s TTL)
-- Thread-safe concurrent operations
-- Leader tracking and hints for clients
+- `Get`/`Put`/`Append` operations through Raft (every read goes through the log — provably linearizable)
+- Duplicate detection (`clientId`/`seqNum` cache, cap 100/client, 10s TTL)
+- Wrong-leader hints (`{wrong_leader, leader_id}`) so clients fail over fast
+- Pending-op tracking with 5s timeout and `ErrTooManyPending` backpressure
+- `Clerk` client library: lazy dial, 1000-attempt retry, exponential backoff 50ms→1s cap
 
----
+### Configuration-driven identity
 
-## Technical Highlights
+Node IDs are opaque integers from `cluster.yaml` — never derived from ports. Each node matches itself by `-id` and learns its peers from the same file. No `deriveIdFromAddress`, no port-coupling, no surprises on ephemeral test ports.
 
-### Challenges Solved
+### Forward-compatible with snapshotting
 
-| Challenge                  | Solution                                                                          |
-| -------------------------- | --------------------------------------------------------------------------------- |
-| **Leader Election**        | Randomized timeouts prevent split votes; exponential backoff for failed elections |
-| **Log Consistency**        | `nextIndex`/`matchIndex` tracking with automatic retry on mismatch                |
-| **Network Partitions**     | Leader steps down when partitioned; new leader elected on majority side           |
-| **Crash Recovery**         | Persistent state (term, votedFor, log) restored atomically on startup             |
-| **Exactly-Once Semantics** | Client sequence numbers with server-side deduplication cache                      |
-| **Client Failover**        | Automatic leader discovery with 1000-attempt retry and exponential backoff        |
+0.1.0 doesn't implement log compaction, but the seams are baked in so the eventual snapshotting work is additive: `ApplyMsg` already carries snapshot fields (zero-valued), `logBase` is declared and used in every log access, `raft.proto` declares `InstallSnapshot` (handler returns `codes.Unimplemented`), and `cluster.yaml` carries a `snapshot_threshold` knob (default `0` = disabled).
 
-### Key Design Decisions
-
-**Why Raft over Paxos?**
-Raft prioritizes understandability without sacrificing correctness. Its "separability" (leader election, log replication, safety as independent components) makes it ideal for learning and production implementations.
-
-**Why gRPC?**
-Type-safe Protocol Buffers with built-in features: HTTP/2 multiplexing, flow control, and keepalive health checks. Critical for detecting failed nodes quickly.
-
-**Why Strong Consistency (Linearizability)?**
-Every operation appears to execute instantaneously at some point between invocation and response. Simpler application logic compared to eventual consistency—at the cost of availability during partitions.
-
-### CAP Theorem Position
-
-distribKV chooses **CP** (Consistency + Partition Tolerance):
-
-- During network partitions, the system remains consistent
-- Minority partitions become unavailable (no "split-brain")
-- When partition heals, nodes automatically rejoin with consistent state
-
----
-
-## Quality Assurance
-
-### Testing Strategy
-
-```bash
-# Race condition detection
-go test -race ./...
-
-# Specific component tests
-go test ./pkg/raft -run TestElection -v
-go test ./pkg/kvserver -run TestConcurrent -v
-
-# Coverage with race detection
-go test -race -cover ./...
-```
-
-### Validated Behaviors
-
-- ✅ Leader election within 300ms after failure
-- ✅ Log replication to majority before commit
-- ✅ Automatic recovery after node crash
-- ✅ Linearizability under concurrent clients
-- ✅ Duplicate request elimination
-- ✅ 2+ minutes continuous cluster operation
-
----
-
-## Quick Start
-
-### Prerequisites
-
-- Go 1.25.5+
-- Protocol Buffers compiler (`protoc`)
-
-### Build
-
-```bash
-git clone https://github.com/jonandonigv/distribKV.git
-cd distribKV
-go mod tidy
-go build -o bin/ ./cmd/...
-```
-
-### Run a Cluster
-
-```bash
-# Start 3-node cluster (uses provided script)
-./scripts/start-cluster.sh
-
-# Or start manually
-cd bin
-./kvserver -id=1 -peers="localhost:10001,localhost:10002,localhost:10003" &
-./kvserver -id=2 -peers="localhost:10001,localhost:10002,localhost:10003" &
-./kvserver -id=3 -peers="localhost:10001,localhost:10002,localhost:10003" &
-```
-
-### Use the Client
-
-```go
-package main
-
-import (
-    "fmt"
-    "github.com/jonandonigv/distribKV/pkg/kvserver"
-)
-
-func main() {
-    // Connect to cluster
-    ck := kvserver.MakeClerk([]string{
-        "localhost:10001",
-        "localhost:10002",
-        "localhost:10003",
-    }, false)
-
-    // Operations automatically route to leader
-    ck.Put("key", "value")
-    value := ck.Get("key")
-    ck.Append("key", "-suffix")
-
-    fmt.Println(ck.Get("key")) // "value-suffix"
-}
-```
-
----
-
-## Project Structure
+## Project structure
 
 ```
 distribKV/
 ├── cmd/
-│   ├── kvserver/          # Main KV server binary
-│   ├── kv-client/         # Interactive test client
-│   ├── grpc-test-server/  # gRPC health check testing
-│   └── grpc-test-client/  # gRPC health check testing
-├── pkg/
-│   ├── raft/              # Core Raft consensus (~1,200 LOC)
-│   │   ├── raft.go        # Main struct and state machine
-│   │   ├── election.go    # Leader election and timers
-│   │   ├── replication.go # Log replication and heartbeats
-│   │   └── persistance.go # State persistence
-│   ├── kvserver/          # KV service layer (~800 LOC)
-│   │   ├── server.go      # RPC handlers and apply loop
-│   │   ├── clerk.go       # Client library
-│   │   └── types.go       # Type definitions
-│   └── common/            # gRPC utilities
-├── proto/                 # Protocol Buffer definitions
-│   ├── raft.proto         # Raft RPCs
-│   ├── kv.proto           # KV service RPCs
-│   └── health.proto       # Health check service
-└── scripts/               # Cluster management scripts
+│   └── kvserver/      # single binary (server + healthcheck subcommand)
+├── config/            # cluster.yaml parsing
+├── raft/              # consensus engine; *_test.go files include the test harness
+├── kv/                # KV state machine + Clerk client library
+├── server/            # binary wiring (run.go, grpc.go)
+├── health/            # Health gRPC service impl
+├── proto/             # .proto source files (raft, kv, health)
+├── configs/
+│   └── cluster.yaml   # canonical 3-node cluster definition
+├── docker-compose.yml # spins 3 kvserver replicas with healthchecks
+├── Dockerfile         # multi-stage Go builder; runtime = distroless/static
+├── Makefile           # proto/build/test/run/cluster targets
+└── ...reference docs (project.md, Architecture.png, CONTRIBUTING.md)
 ```
 
----
+Generated `.pb.go` files live in the consuming package (`raft/raft.pb.go` next to `raft.go`, etc.), so the code references proto types without a `pb.` import indirection.
 
-## Tech Stack & Skills Demonstrated
+## Status
 
-### Languages & Frameworks
+In active development on the `0.1.0` branch — a clean rebuild of the earlier `0.0.x` prototype. The previous implementation (Raft elections, log replication, persistence, KV state machine, client clerk, test harness) is preserved on the `archive/test-harness-v1` branch as a reference while the new version is rebuilt test-first.
 
-- **Go 1.25.5** — Concurrency primitives (goroutines, channels, mutexes, sync.Cond)
-- **gRPC** — High-performance RPC framework with streaming support
-- **Protocol Buffers** — Type-safe message serialization
+The rebuild is sequenced as:
 
-### Distributed Systems Concepts
+1. **Config package** — `cluster.yaml` parsing + table tests
+2. **Protos** — `raft`/`kv`/`health` `.proto` regenerated into consumer packages
+3. **Raft core** — election, replication, persistence, shutdown — TDD red/green
+4. **KV service** — state machine, dedup, apply loop, wrong-leader hints
+5. **Clerk** — leader discovery, retry, exactly-once
+6. **Server wiring + binary** — startup order, signal handling, graceful shutdown
+7. **Deployment** — `Dockerfile`, `docker-compose.yml`, self-healthcheck subcommand
+8. **Makefile** — `proto`/`build`/`test`/`run`/`cluster-up`/`cluster-down`/`smoke`
 
-- **Consensus Algorithms** — Raft (leader election, log replication, safety)
-- **Fault Tolerance** — Crash recovery, network partition handling
-- **Consistency Models** — Linearizability, CAP theorem tradeoffs
-- **State Machine Replication** — Deterministic execution of replicated logs
+## Build & test
 
-### System Design Patterns
+Once the Makefile lands (rebuild step 8), the canonical commands are:
 
-- **Concurrent Programming** — Lock-free patterns where possible, careful mutex ordering
-- **Error Handling** — Explicit error returns, no panics in normal operation
-- **Resource Management** — Proper connection lifecycle, context cancellation
-- **Persistence** — Atomic file operations, crash-safe state management
+```bash
+make proto              # regenerate all .pb.go from .proto (never hand-edit .pb.go)
+make build              # build ./cmd/kvserver to bin/
+make test               # go test -race -cover ./...
+make test-cover         # open HTML coverage report
 
----
+# Local 3-node cluster
+make run                # 3 background processes
+make smoke              # in-process Clerk against a running cluster
+
+# Docker
+make cluster-up         # docker-compose up -d
+make cluster-down       # docker-compose down
+make cluster-logs       # docker-compose logs -f
+```
+
+Tests use `github.com/stretchr/testify` (`require` for fatal assertions, `assert` for non-fatal, `require.Eventually`/`Never` for async conditions — no `time.Sleep`). The race detector is mandatory.
+
+## Cluster configuration
+
+```yaml
+cluster:
+  name: distribkv-dev
+  heartbeat_interval: 50ms
+  election_timeout_min: 150ms
+  election_timeout_max: 300ms
+  data_dir: /var/lib/distribkv
+  snapshot_threshold: 0    # entries; 0 = never snapshot (deferred)
+
+nodes:
+  - id: 1
+    listen_addr: "0.0.0.0:10001"
+  - id: 2
+    listen_addr: "0.0.0.0:10002"
+  - id: 3
+    listen_addr: "0.0.0.0:10003"
+```
+
+Run a node with: `kvserver -config configs/cluster.yaml -id 1 -log.level info -log.format text`
 
 ## Resources
 
-- [Raft Paper](https://raft.github.io/raft.pdf) — The consensus algorithm foundation
-- [MIT 6.824 Distributed Systems](https://pdos.csail.mit.edu/6.824/) — Course inspiration
-- [Raft Visualization](https://raft.github.io/) — Interactive algorithm demo
-
----
-
-## License
-
-MIT
+- [Raft Paper](https://raft.github.io/raft.pdf) — the consensus algorithm foundation
+- [Raft Visualization](https://raft.github.io/) — interactive algorithm demo
+- [MIT 6.824 Distributed Systems](https://pdos.csail.mit.edu/6.824/) — course inspiration
 
 ---
 
