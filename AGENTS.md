@@ -28,7 +28,12 @@ distribKV/
 └── ...reference docs (project.md, Architecture.png, CONTRIBUTING.md, Notes/)
 ```
 
-Generated `.pb.go` files live in the consuming package (`raft/raft.pb.go` next to `raft.go`, etc.), so consumers reference proto types without a `pb.` import indirection.
+Generated `.pb.go` files live in the consuming package:
+- `kv/kv.pb.go` and `kv/kv_grpc.pb.go`
+- `health/health.pb.go` and `health/health_grpc.pb.go`
+- `raft/raftpb/raft.pb.go` and `raft/raftpb/raft_grpc.pb.go` (subdirectory, not the raft package itself — see below)
+
+**Why raft uses a `raftpb/` subpackage**: the proto-generated `LogEntry` embeds `protoimpl.MessageState` (which contains a `sync.Mutex`). Ranging over a `[]LogEntry` slice value-copies the entry and trips `go vet` ("range var copies lock"). Since the Raft package ranges over its log slice constantly, we keep our own domain `raft.LogEntry` (plain struct, no mutex) for in-package use and convert to/from `raftpb.LogEntry` only at the RPC boundary in `election.go` and `replication.go`. KV and Health don't have this issue (no per-message slice iteration) so their generated files stay flat in the consumer package. Reference: etcd's `raft/raftpb` and HashiCorp Raft follow the same split.
 
 ## Build, Lint, and Test Commands
 

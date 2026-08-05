@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package distribkv.raft;
 
-option go_package = "github.com/jonandonigv/distribKV/raft;raft";
+option go_package = "github.com/jonandonigv/distribKV/raft/raftpb;raftpb";
 
 // Raft implements the consensus algorithm peer-to-peer RPCs.
 // Per Raft paper sections 3-5 plus the InstallSnapshot RPC from section 7.
