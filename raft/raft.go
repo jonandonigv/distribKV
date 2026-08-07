@@ -22,12 +22,15 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jonandonigv/distribKV/raft/raftpb"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 // Config holds the parameters needed to construct a Raft node. The
@@ -120,6 +123,9 @@ type Raft struct {
 
 	// Heartbeat sender (leader-only). ticker is nil until becomeLeader.
 	heartbeatInterval time.Duration
+
+	// Vote counting during election (only meaningful while state == Candidate).
+	votesReceived int
 
 	// Apply pipeline: applyCh delivers committed entries to the KV
 	// state machine; commitCh wakes the apply loop when commitIndex
@@ -346,4 +352,193 @@ func (r *Raft) Log() []LogEntry {
 	out := make([]LogEntry, len(r.log))
 	copy(out, r.log)
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle: SetDeterministicTimeout, Start, Shutdown, applyLoop.
+// ---------------------------------------------------------------------------
+
+// SetDeterministicTimeout overrides the randomized election timeout with
+// a fixed value. Test-only seam.
+func (r *Raft) SetDeterministicTimeout(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.useDeterministicTimeout = true
+	r.deterministicTimeout = d
+}
+
+// Start launches the election timer and apply loop goroutine. It creates
+// the context that Shutdown cancels. Must be called after the gRPC server
+// is listening (see AGENTS.md "Lifecycle invariants"). Idempotent.
+func (r *Raft) Start() {
+	r.mu.Lock()
+	if r.ctx != nil {
+		r.mu.Unlock()
+		return // already started
+	}
+	r.ctx, r.cancel = context.WithCancel(context.Background())
+	ctx := r.ctx
+	// Arm the election timer.
+	r.electionTimer = time.AfterFunc(r.electionTimeoutLocked(), func() {
+		r.becomeCandidate()
+	})
+	r.mu.Unlock()
+
+	// Start the apply loop goroutine.
+	r.wg.Add(1)
+	go r.applyLoop(ctx)
+}
+
+// Shutdown stops all goroutines (election timer, heartbeat sender, apply
+// loop) and closes peer gRPC connections. Blocks until all goroutines
+// have exited. Safe to call multiple times.
+func (r *Raft) Shutdown() {
+	if !r.shutdown.CompareAndSwap(false, true) {
+		return // already shutting down
+	}
+
+	r.mu.Lock()
+	if r.cancel != nil {
+		r.cancel()
+	}
+	if r.electionTimer != nil {
+		r.electionTimer.Stop()
+	}
+	// Close peer connections so any in-flight RPCs fail fast.
+	for _, p := range r.peers {
+		if p.conn != nil {
+			_ = p.conn.Close()
+			p.conn = nil
+			p.raftClient = nil
+		}
+	}
+	r.mu.Unlock()
+
+	r.wg.Wait()
+}
+
+// applyLoop is the always-running goroutine that sends committed log
+// entries to the consumer via applyCh. It wakes on commitCh signals;
+// dropped signals are harmless because it re-reads commitIndex under
+// the mutex.
+func (r *Raft) applyLoop(ctx context.Context) {
+	defer r.wg.Done()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.commitCh:
+			r.applyPendingEntries(ctx)
+		}
+	}
+}
+
+// applyPendingEntries sends all un-applied committed entries to applyCh.
+// It stops when lastApplied catches up to commitIndex or when ctx is
+// cancelled (shutdown).
+func (r *Raft) applyPendingEntries(ctx context.Context) {
+	for {
+		r.mu.Lock()
+		if r.lastApplied >= r.commitIndex {
+			r.mu.Unlock()
+			return
+		}
+		r.lastApplied++
+		idx := r.lastApplied
+		arrayIdx := idx - r.logBase - 1
+		if arrayIdx < 0 || arrayIdx >= len(r.log) {
+			r.lastApplied--
+			r.mu.Unlock()
+			return
+		}
+		entry := r.log[arrayIdx]
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      append([]byte(nil), entry.Command...),
+			CommandIndex: int(entry.Index),
+		}
+		r.mu.Unlock()
+
+		select {
+		case r.applyCh <- msg:
+		case <-ctx.Done():
+			// Undo the increment so the next Start can re-apply.
+			r.mu.Lock()
+			r.lastApplied--
+			r.mu.Unlock()
+			return
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers (called under r.mu unless noted).
+// ---------------------------------------------------------------------------
+
+// electionTimeoutLocked returns a randomized timeout in [min, max) or the
+// deterministic value if SetDeterministicTimeout was called. Caller must
+// hold r.mu.
+func (r *Raft) electionTimeoutLocked() time.Duration {
+	if r.useDeterministicTimeout {
+		return r.deterministicTimeout
+	}
+	spread := int(r.electionTimeoutMax - r.electionTimeoutMin)
+	return r.electionTimeoutMin + time.Duration(rand.Intn(spread))
+}
+
+// resetElectionTimerLocked arms the election timer with a fresh timeout.
+// Caller must hold r.mu.
+func (r *Raft) resetElectionTimerLocked() {
+	if r.electionTimer != nil {
+		r.electionTimer.Reset(r.electionTimeoutLocked())
+	}
+}
+
+// getLastLogInfoLocked returns the absolute index and term of the last
+// log entry, or (0, 0) if the log is empty. Caller must hold r.mu.
+func (r *Raft) getLastLogInfoLocked() (int, int) {
+	if len(r.log) == 0 {
+		return 0, 0
+	}
+	last := r.log[len(r.log)-1]
+	return int(last.Index), int(last.Term)
+}
+
+// persist saves currentTerm, votedFor, and log via the persister. Caller
+// must hold r.mu (the persister has its own mutex so no deadlock).
+func (r *Raft) persist() error {
+	return r.persister.Save(r.currentTerm, r.votedFor, r.log)
+}
+
+// ---------------------------------------------------------------------------
+// Peer connection management.
+// ---------------------------------------------------------------------------
+
+// ensureConnected lazily dials the peer's gRPC server if no connection
+// is established. Uses grpc.NewClient (non-blocking) so the first call
+// returns immediately; the actual TCP connect happens in the background
+// and the first RPC will block until it succeeds or times out.
+// See AGENTS.md gRPC Guidelines.
+func (p *peer) ensureConnected(ctx context.Context) error {
+	if p.conn != nil && p.raftClient != nil {
+		return nil
+	}
+
+	kacp := keepalive.ClientParameters{
+		Time:                10 * time.Second,
+		Timeout:             3 * time.Second,
+		PermitWithoutStream: true,
+	}
+
+	conn, err := grpc.NewClient(p.address,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithKeepaliveParams(kacp),
+	)
+	if err != nil {
+		return fmt.Errorf("dial peer %d at %s: %w", p.id, p.address, err)
+	}
+
+	p.conn = conn
+	p.raftClient = raftpb.NewRaftClient(conn)
+	return nil
 }
