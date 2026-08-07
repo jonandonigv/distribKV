@@ -95,7 +95,15 @@ func (r *Raft) sendRequestVote(peerId int, term int) {
 	lastIdx, lastTerm := r.getLastLogInfoLocked()
 	r.mu.Unlock()
 
-	resp, err := peer.raftClient.RequestVote(ctx, &raftpb.RequestVoteRequest{
+	// Snapshot the raftClient under connMu to safely race with Shutdown.
+	peer.connMu.RLock()
+	raftClient := peer.raftClient
+	peer.connMu.RUnlock()
+	if raftClient == nil {
+		return
+	}
+
+	resp, err := raftClient.RequestVote(ctx, &raftpb.RequestVoteRequest{
 		Term:         int64(term),
 		CandidateId:  int32(r.serverId),
 		LastLogIndex: int64(lastIdx),

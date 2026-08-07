@@ -76,6 +76,7 @@ type peer struct {
 	id      int
 	address string
 
+	connMu     sync.RWMutex // guards conn and raftClient
 	conn       *grpc.ClientConn
 	raftClient raftpb.RaftClient
 
@@ -406,11 +407,13 @@ func (r *Raft) Shutdown() {
 	}
 	// Close peer connections so any in-flight RPCs fail fast.
 	for _, p := range r.peers {
+		p.connMu.Lock()
 		if p.conn != nil {
 			_ = p.conn.Close()
 			p.conn = nil
 			p.raftClient = nil
 		}
+		p.connMu.Unlock()
 	}
 	r.mu.Unlock()
 
@@ -487,6 +490,7 @@ func (r *Raft) electionTimeoutLocked() time.Duration {
 }
 
 // resetElectionTimerLocked arms the election timer with a fresh timeout.
+// No-op if the timer hasn't been created yet (i.e. Start() not called).
 // Caller must hold r.mu.
 func (r *Raft) resetElectionTimerLocked() {
 	if r.electionTimer != nil {
@@ -520,6 +524,22 @@ func (r *Raft) persist() error {
 // and the first RPC will block until it succeeds or times out.
 // See AGENTS.md gRPC Guidelines.
 func (p *peer) ensureConnected(ctx context.Context) error {
+	// Fast path: already connected. Read conn without holding Raft.mu
+	// because conn is only mutated under Raft.mu in Shutdown and here;
+	// the caller (sendAppendEntries / sendRequestVote) checks shutdown
+	// BEFORE calling us, so a racing Shutdown is detected by the next
+	// RPC returning a "connection closed" error rather than here.
+	p.connMu.RLock()
+	if p.conn != nil && p.raftClient != nil {
+		p.connMu.RUnlock()
+		return nil
+	}
+	p.connMu.RUnlock()
+
+	p.connMu.Lock()
+	defer p.connMu.Unlock()
+
+	// Double-check after acquiring the write lock.
 	if p.conn != nil && p.raftClient != nil {
 		return nil
 	}
