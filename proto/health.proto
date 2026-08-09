@@ -1,24 +1,37 @@
 syntax = "proto3";
 
-package health;
+package distribkv.health;
 
-option go_package = "github.com/jonandonigv/distribKV/proto/health";
+option go_package = "github.com/jonandonigv/distribKV/health;health";
 
+// Health is the per-node health service. Used by the kvserver self-
+// healthcheck subcommand and by docker-compose healthcheck blocks.
+//
+// We declare our own (trivial) messages rather than importing the standard
+// google/protobuf/health.proto: we chose the self-healthcheck approach
+// (see AGENTS.md), so we don't need standard grpc.health.v1
+// introspection/reflection tool compatibility.
 service Health {
-	rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
-	rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
+  // Check reports the node's serving status. The 0.1.0 impl always
+  // returns SERVING once the gRPC server is accepting connections; a
+  // future status-aware variant could gate on rf.Start() success.
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+
+  // Watch streams serving-status updates. The 0.1.0 impl returns
+  // codes.Unimplemented; the message is declared for schema stability.
+  rpc Watch(HealthCheckRequest) returns (stream HealthCheckResponse);
 }
 
 message HealthCheckRequest {
-	string service = 1;
+  string service = 1; // optional service name; ignored in 0.1.0
 }
 
 message HealthCheckResponse {
-	enum ServingStatus {
-		UNKNOWN = 0;
-		SERVING = 1;
-		NOT_SERVING = 2;
-		SERVICE_UNKNOWN = 3;
-	}
-	ServingStatus status = 1;
+  enum ServingStatus {
+    UNKNOWN = 0;
+    SERVING = 1;
+    NOT_SERVING = 2;
+    SERVICE_UNKNOWN = 3; // never sent by servers; used by callers
+  }
+  ServingStatus status = 1;
 }

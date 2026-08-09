@@ -1,7 +1,11 @@
-./.DS_Store
+# macOS
 .DS_Store
+
+# Build artifacts
 /bin
-./TODO.md
-./data
-TODO.md
-data
+
+# Runtime data and logs (per-node state lives under these, created at runtime)
+/data
+
+# Local notes / scratch
+/TODO.md
