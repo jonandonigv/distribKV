@@ -1,0 +1,20 @@
+# distribKV cluster definition
+#
+# Each node matches itself by -id; peers are the other entries.
+# data_dir per-node is optional; defaults to <cluster.data_dir>/<id>.
+
+cluster:
+  name: distribkv-dev
+  heartbeat_interval: 50ms
+  election_timeout_min: 150ms
+  election_timeout_max: 300ms
+  data_dir: /var/lib/distribkv
+  snapshot_threshold: 0    # entries; 0 = never snapshot (deferred)
+
+nodes:
+  - id: 1
+    listen_addr: "0.0.0.0:10001"
+  - id: 2
+    listen_addr: "0.0.0.0:10002"
+  - id: 3
+    listen_addr: "0.0.0.0:10003"

@@ -1,55 +1,68 @@
-.PHONY: all build kvserver server client kv-client test clean fmt lint tidy help
+# distribKV Makefile
+#
+# Common targets:
+#   make proto        regenerate all .pb.go from .proto
+#   make build        build cmd/kvserver to bin/
+#   make test         go test -race -cover ./...
+#   make test-cover   open HTML coverage report
+#   make run          run a 3-node cluster locally (step 8)
+#   make cluster-up   docker-compose up -d (step 8)
+#   make fmt          gofmt -w .
+#   make tidy         go mod tidy
+#   make clean        rm -rf bin/
 
-help:
-	@echo "Available targets:"
-	@echo "  all        - Run tidy and build all binaries"
-	@echo "  build      - Build all binaries (kvserver, kv-client, grpc-test-server, grpc-test-client)"
-	@echo "  kvserver   - Build kvserver binary (Raft KV store)"
-	@echo "  kv-client  - Build kv-client binary (KV cluster test client)"
-	@echo "  server     - Build gRPC test server binary"
-	@echo "  client     - Build gRPC test client binary"
-	@echo "  test       - Run all tests with race detector"
-	@echo "  test-v     - Run tests with verbose output"
-	@echo "  test-raft  - Run Raft package tests with verbose output"
-	@echo "  tidy       - Run go mod tidy"
-	@echo "  clean      - Remove binaries"
-	@echo "  fmt        - Format code with gofmt"
-	@echo "  lint       - Run golangci-lint (if installed)"
-	@echo "  help       - Show this help message"
+PROTO_DIR     := proto
+PROTO_FILES   := $(wildcard $(PROTO_DIR)/*.proto)
+PROTO_GEN_GO  := protoc-gen-go
+PROTO_GEN_RPC := protoc-gen-go-grpc
+BIN_DIR       := bin
+
+.PHONY: all proto build test test-cover run cluster-up cluster-down cluster-logs smoke fmt tidy clean help
 
 all: tidy build
 
-build: kvserver kv-client server client
+## proto: regenerate all .pb.go from .proto (never hand-edit .pb.go)
+proto:
+	@which $(PROTO_GEN_GO)  >/dev/null 2>&1 || go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+	@which $(PROTO_GEN_RPC) >/dev/null 2>&1 || go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+	protoc \
+		--go_out=. --go_opt=module=github.com/jonandonigv/distribKV \
+		--go-grpc_out=. --go-grpc_opt=module=github.com/jonandonigv/distribKV \
+		$(PROTO_FILES)
+	@echo "regenerated: $(PROTO_FILES)"
 
-kvserver:
-	go build -o bin/kvserver ./cmd/kvserver
+## build: build cmd/kvserver to bin/
+build:
+	@mkdir -p $(BIN_DIR)
+	go build -o $(BIN_DIR)/kvserver ./cmd/kvserver
 
-kv-client:
-	go build -o bin/kv-client ./cmd/kv-client
-
-server:
-	go build -o bin/grpc-test-server ./cmd/grpc-test-server
-
-client:
-	go build -o bin/grpc-test-client ./cmd/grpc-test-client
-
+## test: go test -race -cover ./...
 test:
-	go test -race ./...
+	go test -race -cover ./...
 
-test-v:
-	go test -race -v ./...
+## test-cover: open HTML coverage report
+test-cover:
+	go test -race -coverprofile=coverage.out ./...
+	go tool cover -html=coverage.out
 
-test-raft:
-	go test -race ./pkg/raft -v
-
-tidy:
-	go mod tidy
-
-clean:
-	rm -rf bin/
-
+## fmt: gofmt -w .
 fmt:
 	gofmt -w .
 
-lint:
-	golangci-lint run ./... || true
+## tidy: go mod tidy
+tidy:
+	go mod tidy
+
+## clean: rm -rf bin/ and coverage artifacts
+clean:
+	rm -rf $(BIN_DIR) coverage.out
+
+## run / cluster-* / smoke: stubs for step 8 (deployment)
+run:
+	@echo "make run is a stub — implemented in step 8"
+
+cluster-up cluster-down cluster-logs smoke:
+	@echo "$@ is a stub — implemented in step 8"
+
+help:
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed -e 's/^## //' | column -t -s ':'
