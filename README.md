@@ -52,41 +52,37 @@ Node IDs are opaque integers from `cluster.yaml` — never derived from ports. E
 ```
 distribKV/
 ├── cmd/
-│   └── kvserver/      # single binary (server + healthcheck subcommand)
+│   └── kvserver/      # single binary (server + healthcheck subcommand) — ships 0.1.1
 ├── config/            # cluster.yaml parsing
 ├── raft/              # consensus engine; *_test.go files include the test harness
 ├── kv/                # KV state machine + Clerk client library
-├── server/            # binary wiring (run.go, grpc.go)
-├── health/            # Health gRPC service impl
+├── server/            # binary wiring (run.go, grpc.go) — ships 0.1.1
+├── health/            # Health gRPC service impl — ships 0.1.1
 ├── proto/             # .proto source files (raft, kv, health)
 ├── configs/
 │   └── cluster.yaml   # canonical 3-node cluster definition
-├── docker-compose.yml # spins 3 kvserver replicas with healthchecks
-├── Dockerfile         # multi-stage Go builder; runtime = distroless/static
-├── Makefile           # proto/build/test/run/cluster targets
-└── ...reference docs (project.md, Architecture.png, CONTRIBUTING.md)
+├── docker-compose.yml # 3 kvserver replicas with healthchecks — ships 0.1.1
+├── Dockerfile         # multi-stage Go builder; distroless/static runtime — ships 0.1.1
+├── Makefile           # proto/build/test live; run/cluster/smoke land in 0.1.1
+└── ...reference docs (project.md, Architecture.png, CONTRIBUTING.md, AGENTS.md, Notes/)
 ```
 
-Generated `.pb.go` files live in the consuming package (`raft/raft.pb.go` next to `raft.go`, etc.), so the code references proto types without a `pb.` import indirection.
+Generated `.pb.go` files live in the consuming package so code references proto types without a `pb.` import indirection. Raft uses a `raft/raftpb/` subpackage because its proto `LogEntry` embeds a mutex that trips `go vet` on slice iteration; `kv` and `health` keep theirs flat in the package.
 
 ## Status
 
-In active development on the `0.1.0` branch — a clean rebuild of the earlier `0.0.x` prototype. The previous implementation (Raft elections, log replication, persistence, KV state machine, client clerk, test harness) is preserved on the `archive/test-harness-v1` branch as a reference while the new version is rebuilt test-first.
+The core engine is complete and merged to `main` (shipped as **0.1.0**): config parsing, protos, the full Raft core (election, log replication, persistence, clean shutdown), and the KV service with its Clerk client — all `-race` green with a 90%+ coverage target on the consensus core.
 
-The rebuild is sequenced as:
+The remainder is in progress on the `0.1.1` branch:
 
-1. **Config package** — `cluster.yaml` parsing + table tests
-2. **Protos** — `raft`/`kv`/`health` `.proto` regenerated into consumer packages
-3. **Raft core** — election, replication, persistence, shutdown — TDD red/green
-4. **KV service** — state machine, dedup, apply loop, wrong-leader hints
-5. **Clerk** — leader discovery, retry, exactly-once
-6. **Server wiring + binary** — startup order, signal handling, graceful shutdown
-7. **Deployment** — `Dockerfile`, `docker-compose.yml`, self-healthcheck subcommand
-8. **Makefile** — `proto`/`build`/`test`/`run`/`cluster-up`/`cluster-down`/`smoke`
+5. **Server wiring + binary** — startup order, signal handling, graceful shutdown
+6. **Health service** — gRPC health impl + self-healthcheck subcommand
+7. **Deployment** — `Dockerfile`, `docker-compose.yml`, 3-replica stack
+8. **Makefile + smoke** — `run`/`cluster-up`/`cluster-down`/`cluster-logs`/`smoke`
 
 ## Build & test
 
-Once the Makefile lands (rebuild step 8), the canonical commands are:
+The `proto`/`build`/`test`/`test-cover`/`fmt`/`tidy` targets are live. The `run`/`cluster-*`/`smoke` targets land with the deployment phase (0.1.1):
 
 ```bash
 make proto              # regenerate all .pb.go from .proto (never hand-edit .pb.go)
@@ -126,7 +122,7 @@ nodes:
     listen_addr: "0.0.0.0:10003"
 ```
 
-Run a node with: `kvserver -config configs/cluster.yaml -id 1 -log.level info -log.format text`
+Once the `kvserver` binary ships (0.1.1): `kvserver -config configs/cluster.yaml -id 1 -log.level info -log.format text`
 
 ## Resources
 
