@@ -50,13 +50,13 @@ func TestDeserializeCommand_CorruptBytes(t *testing.T) {
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 	rf, err := raft.NewRaft(raft.Config{
-		ServerID:            1,
-		OwnAddr:             "127.0.0.1:0",
-		Peers:               map[int]string{},
-		ElectionTimeoutMin:  150 * time.Millisecond,
-		ElectionTimeoutMax:  300 * time.Millisecond,
-		HeartbeatInterval:   50 * time.Millisecond,
-		Persister:           raft.NewMemoryPersister(),
+		ServerID:           1,
+		OwnAddr:            "127.0.0.1:0",
+		Peers:              map[int]string{},
+		ElectionTimeoutMin: 150 * time.Millisecond,
+		ElectionTimeoutMax: 300 * time.Millisecond,
+		HeartbeatInterval:  50 * time.Millisecond,
+		Persister:          raft.NewMemoryPersister(),
 	})
 	require.NoError(t, err)
 	return &Server{
@@ -73,7 +73,6 @@ func newTestServer(t *testing.T) *Server {
 func TestApplyCommand_Put(t *testing.T) {
 	s := newTestServer(t)
 
-
 	s.mu.Lock()
 	s.applyCommandLocked(Op{Type: OpPut, Key: "foo", Value: "bar"})
 	val, ok := s.state["foo"]
@@ -85,7 +84,6 @@ func TestApplyCommand_Put(t *testing.T) {
 
 func TestApplyCommand_Append(t *testing.T) {
 	s := newTestServer(t)
-
 
 	s.mu.Lock()
 	s.applyCommandLocked(Op{Type: OpPut, Key: "k", Value: "hello"})
@@ -99,7 +97,6 @@ func TestApplyCommand_Append(t *testing.T) {
 func TestApplyCommand_Get(t *testing.T) {
 	s := newTestServer(t)
 
-
 	s.mu.Lock()
 	s.state["key"] = "value"
 	result := s.applyCommandLocked(Op{Type: OpGet, Key: "key"})
@@ -112,7 +109,6 @@ func TestApplyCommand_Get(t *testing.T) {
 func TestApplyCommand_GetMissingKey(t *testing.T) {
 	s := newTestServer(t)
 
-
 	s.mu.Lock()
 	result := s.applyCommandLocked(Op{Type: OpGet, Key: "nonexistent"})
 	s.mu.Unlock()
@@ -122,7 +118,6 @@ func TestApplyCommand_GetMissingKey(t *testing.T) {
 
 func TestDedupCache_SameClientSeqReturnsCachedResult(t *testing.T) {
 	s := newTestServer(t)
-
 
 	clientId := int64(1)
 	seqNum := int64(1)
@@ -147,7 +142,6 @@ func TestDedupCache_SameClientSeqReturnsCachedResult(t *testing.T) {
 func TestDedupCache_ExpiredEntryEvicted(t *testing.T) {
 	s := newTestServer(t)
 
-
 	clientId := int64(2)
 	seqNum := int64(1)
 
@@ -168,7 +162,6 @@ func TestDedupCache_ExpiredEntryEvicted(t *testing.T) {
 func TestDedupCache_CapEviction(t *testing.T) {
 	s := newTestServer(t)
 
-
 	clientId := int64(3)
 
 	// Insert more than cap entries.
@@ -188,8 +181,8 @@ func TestDedupCache_CapEviction(t *testing.T) {
 
 	// The oldest entries (0..9) should be evicted; entries 10..110 should survive.
 	s.mu.Lock()
-	_, hasOld := s.duplicates[clientId][0]     // oldest — should be evicted
-	_, hasNew := s.duplicates[clientId][109]   // newest — should survive
+	_, hasOld := s.duplicates[clientId][0]   // oldest — should be evicted
+	_, hasNew := s.duplicates[clientId][109] // newest — should survive
 	s.mu.Unlock()
 	assert.False(t, hasOld, "oldest entry should be evicted")
 	assert.True(t, hasNew, "newest entry should survive")

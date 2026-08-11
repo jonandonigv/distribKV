@@ -69,14 +69,14 @@ func newKVCluster(t *testing.T, n int) *kvCluster {
 			}
 		}
 		rf, err := raft.NewRaft(raft.Config{
-			ServerID:            i,
-			OwnAddr:             addrs[i],
-			Peers:               peers,
-			ElectionTimeoutMin:  150 * time.Millisecond,
-			ElectionTimeoutMax:  300 * time.Millisecond,
-			HeartbeatInterval:   50 * time.Millisecond,
-			Persister:           raft.NewMemoryPersister(),
-			Logger:              logH,
+			ServerID:           i,
+			OwnAddr:            addrs[i],
+			Peers:              peers,
+			ElectionTimeoutMin: 150 * time.Millisecond,
+			ElectionTimeoutMax: 300 * time.Millisecond,
+			HeartbeatInterval:  50 * time.Millisecond,
+			Persister:          raft.NewMemoryPersister(),
+			Logger:             logH,
 		})
 		require.NoError(t, err)
 		c.rafts[i] = rf
