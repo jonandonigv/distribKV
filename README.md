@@ -45,7 +45,7 @@ Node IDs are opaque integers from `cluster.yaml` — never derived from ports. E
 
 ### Forward-compatible with snapshotting
 
-0.1.0 doesn't implement log compaction, but the seams are baked in so the eventual snapshotting work is additive: `ApplyMsg` already carries snapshot fields (zero-valued), `logBase` is declared and used in every log access, `raft.proto` declares `InstallSnapshot` (handler returns `codes.Unimplemented`), and `cluster.yaml` carries a `snapshot_threshold` knob (default `0` = disabled).
+Log compaction (snapshotting) isn't implemented yet, but the seams are baked in so the eventual work is additive: `ApplyMsg` already carries snapshot fields (zero-valued), `logBase` is declared and used in every log access, `raft.proto` declares `InstallSnapshot` (handler returns `codes.Unimplemented`), and `cluster.yaml` carries a `snapshot_threshold` knob (default `0` = disabled).
 
 ## Project structure
 
@@ -53,7 +53,7 @@ Node IDs are opaque integers from `cluster.yaml` — never derived from ports. E
 distribKV/
 ├── cmd/
 │   ├── kvserver/      # single binary (server + healthcheck subcommand)
-│   └── smoke/        # operator sanity-check tool (make smoke)
+│   └── smoke/         # operator sanity-check tool (make smoke)
 ├── config/            # cluster.yaml parsing
 ├── raft/              # consensus engine; *_test.go files include the test harness
 ├── kv/                # KV state machine + Clerk client library
@@ -61,8 +61,8 @@ distribKV/
 ├── health/            # Health gRPC service impl
 ├── proto/             # .proto source files (raft, kv, health)
 ├── configs/
-│   ├── cluster.yaml        # canonical local-dev cluster (./data, 0.0.0.0 ports)
-│   └── cluster-docker.yaml # docker stack (service-name addrs, /var/lib data)
+│   ├── cluster.yaml         # canonical local-dev cluster (./data, 0.0.0.0 ports)
+│   └── cluster-docker.yaml  # docker stack (service-name addrs, /var/lib data)
 ├── docker-compose.yml # 3 kvserver replicas with healthchecks
 ├── Dockerfile         # multi-stage Go builder; distroless/static runtime
 ├── Makefile           # proto/build/test/run/stop/smoke/cluster-* targets
@@ -70,17 +70,6 @@ distribKV/
 ```
 
 Generated `.pb.go` files live in the consuming package so code references proto types without a `pb.` import indirection. Raft uses a `raft/raftpb/` subpackage because its proto `LogEntry` embeds a mutex that trips `go vet` on slice iteration; `kv` and `health` keep theirs flat in the package.
-
-## Status
-
-The core engine is complete and merged to `main` (shipped as **0.1.0**): config parsing, protos, the full Raft core (election, log replication, persistence, clean shutdown), and the KV service with its Clerk client — all `-race` green with a 90%+ coverage target on the consensus core.
-
-The remainder shipped as **0.1.1** (production wiring, health service, deployment, and operator tooling):
-
-5. **Server wiring + binary** — `cmd/kvserver` with config-driven startup, signal handling, and graceful shutdown
-6. **Health service** — gRPC `Health.Check` + `kvserver healthcheck` subcommand for docker-compose readiness
-7. **Deployment** — `Dockerfile` (distroless runtime), `docker-compose.yml` (3-replica stack), `configs/cluster-docker.yaml`
-8. **Operator tooling** — `cmd/smoke` sanity tool; `make run`/`stop`/`smoke`/`cluster-up`/`cluster-down`/`cluster-logs`
 
 ## Build & test
 
@@ -93,13 +82,14 @@ make test               # go test -race -cover ./...
 make test-cover         # open HTML coverage report
 
 # Local 3-node cluster
-make run                # 3 background processes
-make smoke              # in-process Clerk against a running cluster
+make run                # 3 background processes (logs in .run/)
+make smoke              # Put/Append/Get via Clerk against the running cluster
+make stop               # stop the background processes
 
 # Docker
-make cluster-up         # docker-compose up -d
-make cluster-down       # docker-compose down
-make cluster-logs       # docker-compose logs -f
+make cluster-up         # docker compose up -d --build
+make cluster-down       # docker compose down
+make cluster-logs       # docker compose logs -f
 ```
 
 Tests use `github.com/stretchr/testify` (`require` for fatal assertions, `assert` for non-fatal, `require.Eventually`/`Never` for async conditions — no `time.Sleep`). The race detector is mandatory.
@@ -124,7 +114,7 @@ nodes:
     listen_addr: "0.0.0.0:10003"
 ```
 
-Once the `kvserver` binary ships (0.1.1): `kvserver -config configs/cluster.yaml -id 1 -log.level info -log.format text`
+Run a node with: `bin/kvserver -config configs/cluster.yaml -id 1 -log.level info -log.format text`
 
 ## Resources
 
