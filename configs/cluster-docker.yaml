@@ -1,0 +1,30 @@
+# distribKV canonical docker cluster definition.
+#
+# Each node listens on `kvserver-N:1000N`. Docker's embedded DNS resolves
+# a service's own name to its own container IP, so
+#   net.Listen("tcp", "kvserver-1:10001")
+# binds the local interface inside container kvserver-1, and peers dialing
+# `kvserver-2:10002` reach node 2's listener via the docker network.
+#
+# This avoids any schema change (no advertise_addr field): the same
+# cluster.yaml shape works for local `0.0.0.0:1000N` and docker
+# `service-name:1000N` runs.
+#
+# Host port mappings in docker-compose.yml (1000N:1000N) let `make smoke`
+# or any host-side client reach the cluster via 127.0.0.1:1000N if desired.
+
+cluster:
+  name: distribkv-docker
+  heartbeat_interval: 50ms
+  election_timeout_min: 150ms
+  election_timeout_max: 300ms
+  data_dir: /var/lib/distribkv
+  snapshot_threshold: 0
+
+nodes:
+  - id: 1
+    listen_addr: "kvserver-1:10001"
+  - id: 2
+    listen_addr: "kvserver-2:10002"
+  - id: 3
+    listen_addr: "kvserver-3:10003"

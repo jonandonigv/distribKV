@@ -3,9 +3,14 @@
 
 # Build artifacts
 /bin
+/smoke
+/kvserver
 
 # Runtime data and logs (per-node state lives under these, created at runtime)
 /data
 
 # Local notes / scratch
 /TODO.md
+
+# Local cluster runtime (.run/ from `make run`)
+/.run

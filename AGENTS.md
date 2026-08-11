@@ -13,7 +13,8 @@ Active rebuild is on `0.1.0`; the previous `0.0.x` implementation is archived in
 ```
 distribKV/
 ├── cmd/
-│   └── kvserver/      # single binary (server + healthcheck subcommand)
+│   ├── kvserver/      # single binary (server + healthcheck subcommand)
+│   └── smoke/         # operator Put/Append/Get sanity-check tool
 ├── config/            # cluster.yaml parsing
 ├── raft/              # consensus engine; *_test.go files include the test harness
 ├── kv/                # KV state machine + Clerk client library
@@ -21,11 +22,12 @@ distribKV/
 ├── health/            # Health gRPC service impl
 ├── proto/              # .proto source files (raft, kv, health)
 ├── configs/
-│   └── cluster.yaml   # canonical 3-node cluster definition
-├── docker-compose.yml # spins 3 kvserver replicas with healthchecks
+│   ├── cluster.yaml        # canonical local-dev cluster (./data, 0.0.0.0 ports)
+│   └── cluster-docker.yaml # docker stack (service-name addrs, /var/lib data)
+├── docker-compose.yml # 3 kvserver replicas with healthchecks
 ├── Dockerfile         # multi-stage Go builder; runtime = distroless/static
-├── Makefile           # proto/build/test/run/cluster targets
-└── ...reference docs (project.md, Architecture.png, CONTRIBUTING.md, Notes/)
+├── Makefile           # proto/build/test/run/stop/smoke/cluster targets
+└── ...reference docs (project.md, Architecture.png, CONTRIBUTING.md)
 ```
 
 Generated `.pb.go` files live in the consuming package:

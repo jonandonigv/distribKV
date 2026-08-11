@@ -5,19 +5,26 @@
 #   make build        build cmd/kvserver to bin/
 #   make test         go test -race -cover ./...
 #   make test-cover   open HTML coverage report
-#   make run          run a 3-node cluster locally (step 8)
-#   make cluster-up   docker-compose up -d (step 8)
+#   make run          run a 3-node cluster locally (background)
+#   make stop         stop the local 3-node cluster started by `make run`
+#   make smoke        exercise a Put/Append/Get sequence via a Clerk
+#   make cluster-up   docker compose up -d --build (3 replicas)
+#   make cluster-down   docker compose down
+#   make cluster-logs docker compose logs -f
 #   make fmt          gofmt -w .
 #   make tidy         go mod tidy
-#   make clean        rm -rf bin/
+#   make clean        rm -rf bin/ and coverage artifacts
 
 PROTO_DIR     := proto
 PROTO_FILES   := $(wildcard $(PROTO_DIR)/*.proto)
 PROTO_GEN_GO  := protoc-gen-go
 PROTO_GEN_RPC := protoc-gen-go-grpc
 BIN_DIR       := bin
+RUN_DIR       := .run
+CONFIG        := configs/cluster.yaml
+NODE_IDS      := 1 2 3
 
-.PHONY: all proto build test test-cover run cluster-up cluster-down cluster-logs smoke fmt tidy clean help
+.PHONY: all proto build test test-cover run stop smoke cluster-up cluster-down cluster-logs fmt tidy clean help
 
 all: tidy build
 
@@ -57,12 +64,47 @@ tidy:
 clean:
 	rm -rf $(BIN_DIR) coverage.out
 
-## run / cluster-* / smoke: stubs for step 8 (deployment)
-run:
-	@echo "make run is a stub — implemented in step 8"
+## run: start a 3-node cluster locally in the background.
+## Builds first, then launches bin/kvserver per node; logs land in .run/.
+## Use `make stop` to stop them and `make smoke` to exercise the cluster.
+run: build
+	@mkdir -p $(RUN_DIR)
+	@for id in $(NODE_IDS); do \
+		port=$$(printf '1000%d' $$id); \
+		nohup $(BIN_DIR)/kvserver -config $(CONFIG) -id $$id \
+			> $(RUN_DIR)/node$$id.log 2>&1 & \
+		echo $$! > $(RUN_DIR)/node$$id.pid; \
+		echo "started node $$id (pid $$!) on :$$port, log .run/node$$id.log"; \
+	done
+	@echo "all nodes started. 'make stop' to stop, 'make smoke' to test."
 
-cluster-up cluster-down cluster-logs smoke:
-	@echo "$@ is a stub — implemented in step 8"
+## stop: stop the local 3-node cluster started by `make run`.
+stop:
+	@if [ -d $(RUN_DIR) ]; then \
+		for pidfile in $(RUN_DIR)/*.pid; do \
+			[ -f "$$pidfile" ] && kill $$(cat "$$pidfile") 2>/dev/null || true; \
+		done; \
+		sleep 1; \
+		rm -rf $(RUN_DIR); \
+		echo "cluster stopped"; \
+	else echo "no $(RUN_DIR)/ dir — nothing to stop"; fi
+
+## smoke: exercise a Put/Append/Get sequence against a running cluster.
+## Assumes `make run` (local) or `make cluster-up` (docker) is already up.
+smoke:
+	go run ./cmd/smoke -config $(CONFIG)
+
+## cluster-up: build and start the 3-node docker cluster in the background.
+cluster-up:
+	docker compose up -d --build
+
+## cluster-down: stop and remove the docker cluster (volumes preserved).
+cluster-down:
+	docker compose down
+
+## cluster-logs: tail the docker cluster logs.
+cluster-logs:
+	docker compose logs -f
 
 help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed -e 's/^## //' | column -t -s ':'
