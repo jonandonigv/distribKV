@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/jonandonigv/distribKV/config"
+	"github.com/jonandonigv/distribKV/health"
 	"github.com/jonandonigv/distribKV/kv"
 	"github.com/jonandonigv/distribKV/raft"
 	raftpb "github.com/jonandonigv/distribKV/raft/raftpb"
@@ -129,10 +130,13 @@ func StartFromConfig(cfg *config.Config, nodeID int, logger *slog.Logger) (*Node
 	// 5. Construct the KV state machine (starts its apply loop).
 	kvs := kv.NewServer(rf, kv.DefaultMaxPendingOps, logger)
 
-	// 6. Register raft + kv services on a keepalive-configured server.
+	// 6. Register raft + kv + health services on a keepalive-configured
+	//    server. Health is registered here (Check returns SERVING once
+	//    the gRPC server accepts connections); see AGENTS.md.
 	grpcSrv := newGRPCServer()
 	raftpb.RegisterRaftServer(grpcSrv, rf)
 	kv.RegisterKVServer(grpcSrv, kvs)
+	health.RegisterHealthServer(grpcSrv, health.NewServer())
 
 	// 7. Serve in a goroutine; capture the serve error so Shutdown can
 	//    detect a premature listener failure.

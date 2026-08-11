@@ -10,16 +10,20 @@
 package server_test
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/jonandonigv/distribKV/health"
 	"github.com/jonandonigv/distribKV/kv"
 	"github.com/jonandonigv/distribKV/server"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // configYAML builds a one-node cluster.yaml with the given listen_addr
@@ -181,6 +185,25 @@ func TestStart_RestartRecoversRaftAndAcceptsNewWrites(t *testing.T) {
 	defer ck2.CloseConn()
 	ck2.Put("after", "restart")
 	require.Equal(t, "restart", ck2.Get("after"))
+}
+
+// TestStart_HealthServiceRegistered dials the node's gRPC server with a
+// Health client and calls Check, confirming the Health service is
+// registered through the production wiring (server/run.go).
+func TestStart_HealthServiceRegistered(t *testing.T) {
+	node := startSingleNode(t, t.TempDir())
+	defer node.Shutdown()
+
+	conn, err := grpc.NewClient(node.Addr(),
+		grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	resp, err := health.NewHealthClient(conn).Check(ctx, &health.HealthCheckRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, health.HealthCheckResponse_SERVING, resp.GetStatus())
 }
 
 // testLogger routes slog through t.Log for clean attribution.
