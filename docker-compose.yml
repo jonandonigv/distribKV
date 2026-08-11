@@ -1,0 +1,65 @@
+# distribKV 3-node cluster.
+#
+# Each service builds the Dockerfile (single binary, distroless runtime)
+# and runs with configs/cluster-docker.yaml, whose listen_addrs use the
+# service-name:port form so intra-cluster dialing resolves over the
+# compose network.
+#
+# Host port mappings (1000N:1000N) let host-side clients reach the
+# cluster (e.g. `make smoke -config configs/cluster-docker.yaml` once
+# the host:port form is used, or a custom config).
+#
+# Each node's raft state is persisted to a named volume so a `cluster-down`
+# + `cluster-up` cycle does not wipe durable state (raft-state.json under
+# /var/lib/distribkv).
+#
+# Healthchecks use the `kvserver healthcheck` subcommand (step 6) so
+# docker wait / depends_on:condition:service_healthy works.
+
+services:
+  kvserver-1:
+    build: .
+    command: ["-config", "configs/cluster-docker.yaml", "-id", "1"]
+    ports:
+      - "10001:10001"
+    volumes:
+      - kv-data-1:/var/lib/distribkv
+    healthcheck:
+      test: ["CMD", "/bin/kvserver", "healthcheck", "-config", "configs/cluster-docker.yaml", "-id", "1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  kvserver-2:
+    build: .
+    command: ["-config", "configs/cluster-docker.yaml", "-id", "2"]
+    ports:
+      - "10002:10002"
+    volumes:
+      - kv-data-2:/var/lib/distribkv
+    healthcheck:
+      test: ["CMD", "/bin/kvserver", "healthcheck", "-config", "configs/cluster-docker.yaml", "-id", "2"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  kvserver-3:
+    build: .
+    command: ["-config", "configs/cluster-docker.yaml", "-id", "3"]
+    ports:
+      - "10003:10003"
+    volumes:
+      - kv-data-3:/var/lib/distribkv
+    healthcheck:
+      test: ["CMD", "/bin/kvserver", "healthcheck", "-config", "configs/cluster-docker.yaml", "-id", "3"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+volumes:
+  kv-data-1:
+  kv-data-2:
+  kv-data-3:

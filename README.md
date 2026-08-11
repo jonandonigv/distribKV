@@ -52,18 +52,20 @@ Node IDs are opaque integers from `cluster.yaml` — never derived from ports. E
 ```
 distribKV/
 ├── cmd/
-│   └── kvserver/      # single binary (server + healthcheck subcommand) — ships 0.1.1
+│   ├── kvserver/      # single binary (server + healthcheck subcommand)
+│   └── smoke/        # operator sanity-check tool (make smoke)
 ├── config/            # cluster.yaml parsing
 ├── raft/              # consensus engine; *_test.go files include the test harness
 ├── kv/                # KV state machine + Clerk client library
-├── server/            # binary wiring (run.go, grpc.go) — ships 0.1.1
-├── health/            # Health gRPC service impl — ships 0.1.1
+├── server/            # binary wiring (run.go, grpc.go)
+├── health/            # Health gRPC service impl
 ├── proto/             # .proto source files (raft, kv, health)
 ├── configs/
-│   └── cluster.yaml   # canonical 3-node cluster definition
-├── docker-compose.yml # 3 kvserver replicas with healthchecks — ships 0.1.1
-├── Dockerfile         # multi-stage Go builder; distroless/static runtime — ships 0.1.1
-├── Makefile           # proto/build/test live; run/cluster/smoke land in 0.1.1
+│   ├── cluster.yaml        # canonical local-dev cluster (./data, 0.0.0.0 ports)
+│   └── cluster-docker.yaml # docker stack (service-name addrs, /var/lib data)
+├── docker-compose.yml # 3 kvserver replicas with healthchecks
+├── Dockerfile         # multi-stage Go builder; distroless/static runtime
+├── Makefile           # proto/build/test/run/stop/smoke/cluster-* targets
 └── ...reference docs (project.md, Architecture.png, CONTRIBUTING.md, AGENTS.md, Notes/)
 ```
 
@@ -73,16 +75,16 @@ Generated `.pb.go` files live in the consuming package so code references proto 
 
 The core engine is complete and merged to `main` (shipped as **0.1.0**): config parsing, protos, the full Raft core (election, log replication, persistence, clean shutdown), and the KV service with its Clerk client — all `-race` green with a 90%+ coverage target on the consensus core.
 
-The remainder is in progress on the `0.1.1` branch:
+The remainder shipped as **0.1.1** (production wiring, health service, deployment, and operator tooling):
 
-5. **Server wiring + binary** — startup order, signal handling, graceful shutdown
-6. **Health service** — gRPC health impl + self-healthcheck subcommand
-7. **Deployment** — `Dockerfile`, `docker-compose.yml`, 3-replica stack
-8. **Makefile + smoke** — `run`/`cluster-up`/`cluster-down`/`cluster-logs`/`smoke`
+5. **Server wiring + binary** — `cmd/kvserver` with config-driven startup, signal handling, and graceful shutdown
+6. **Health service** — gRPC `Health.Check` + `kvserver healthcheck` subcommand for docker-compose readiness
+7. **Deployment** — `Dockerfile` (distroless runtime), `docker-compose.yml` (3-replica stack), `configs/cluster-docker.yaml`
+8. **Operator tooling** — `cmd/smoke` sanity tool; `make run`/`stop`/`smoke`/`cluster-up`/`cluster-down`/`cluster-logs`
 
 ## Build & test
 
-The `proto`/`build`/`test`/`test-cover`/`fmt`/`tidy` targets are live. The `run`/`cluster-*`/`smoke` targets land with the deployment phase (0.1.1):
+The `proto`/`build`/`test`/`test-cover`/`fmt`/`tidy`/`run`/`stop`/`smoke`/`cluster-*` targets are all live:
 
 ```bash
 make proto              # regenerate all .pb.go from .proto (never hand-edit .pb.go)
@@ -110,7 +112,7 @@ cluster:
   heartbeat_interval: 50ms
   election_timeout_min: 150ms
   election_timeout_max: 300ms
-  data_dir: /var/lib/distribkv
+  data_dir: ./data             # local dev (gitignored); docker uses /var/lib/distribkv
   snapshot_threshold: 0    # entries; 0 = never snapshot (deferred)
 
 nodes:
