@@ -12,9 +12,18 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"time"
+
+	"github.com/jonandonigv/distribKV/raft/raftpb"
 )
+
+// maxSnapshotBytes caps a snapshot both locally (Raft.Snapshot refuses to
+// store bigger) and on the wire (InstallSnapshot handler rejects them).
+// 4MB per PLAN.md / AGENTS.md; single-chunk transfer in 0.2.0.
+const maxSnapshotBytes = 4 * 1024 * 1024
 
 // Snapshot compacts the log: all entries with Index <= index are folded
 // into the snapshot. The caller must guarantee it has applied every entry
@@ -31,6 +40,9 @@ func (r *Raft) Snapshot(index int, data []byte) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	if len(data) > maxSnapshotBytes {
+		return fmt.Errorf("snapshot %d bytes exceeds cap %d", len(data), maxSnapshotBytes)
+	}
 	if index > r.commitIndex {
 		return fmt.Errorf("snapshot index %d beyond commitIndex %d", index, r.commitIndex)
 	}
@@ -68,4 +80,79 @@ func (r *Raft) Snapshot(index int, data []byte) error {
 		slog.Int("term", snapTerm),
 		slog.Int("remaining_log", len(r.log)))
 	return nil
+}
+
+// sendInstallSnapshot ships the leader's current snapshot to one peer.
+// Spawned by sendAppendEntries when the peer's nextIndex predates
+// logBase (AppendEntries can never describe that territory). On success
+// the peer is considered caught up through snapshotIndex, and ordinary
+// AppendEntries resumes from there next heartbeat. Runs in its own
+// goroutine; never called with r.mu held (AGENTS.md concurrency rules).
+func (r *Raft) sendInstallSnapshot(peerId int, term int) {
+	if r.shutdown.Load() {
+		return
+	}
+
+	r.mu.Lock()
+	peer, ok := r.peers[peerId]
+	if !ok {
+		r.mu.Unlock()
+		return
+	}
+	if len(r.snapshot) == 0 {
+		r.mu.Unlock()
+		return // nothing to send — shouldn't happen when logBase > 0
+	}
+	data := append([]byte(nil), r.snapshot...)
+	lastIdx, lastTerm := r.snapshotIndex, r.snapshotTerm
+	r.mu.Unlock()
+
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer dialCancel()
+	if err := peer.ensureConnected(dialCtx); err != nil {
+		return
+	}
+
+	peer.connMu.RLock()
+	client := peer.raftClient
+	peer.connMu.RUnlock()
+	if client == nil {
+		return
+	}
+
+	req := &raftpb.InstallSnapshotRequest{
+		Term:              int64(term),
+		LeaderId:          int32(r.serverId),
+		LastIncludedIndex: int64(lastIdx),
+		LastIncludedTerm:  int64(lastTerm),
+		Offset:            0,
+		Data:              data,
+		Done:              true,
+	}
+	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer rpcCancel()
+
+	resp, err := client.InstallSnapshot(rpcCtx, req)
+	if err != nil {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != Leader || r.currentTerm != term || r.shutdown.Load() {
+		return
+	}
+	if resp.Term > int64(r.currentTerm) {
+		r.logger.Info("stepping down: InstallSnapshot peer has higher term",
+			slog.Int("peer", peerId), slog.Int("peer_term", int(resp.Term)))
+		r.stepDown(int(resp.Term))
+		return
+	}
+	// Success (or benign duplicate): the peer now holds everything
+	// through the snapshot point.
+	if lastIdx > peer.matchIndex {
+		peer.matchIndex = lastIdx
+	}
+	peer.nextIndex = peer.matchIndex + 1
+	r.updateCommitIndex()
 }
