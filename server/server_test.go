@@ -11,9 +11,11 @@ package server_test
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -29,13 +31,19 @@ import (
 // configYAML builds a one-node cluster.yaml with the given listen_addr
 // and data_dir. The node id is 1.
 func configYAML(listenAddr, dataDir string) string {
+	return configYAMLWithThreshold(listenAddr, dataDir, 0)
+}
+
+// configYAMLWithThreshold is configYAML with an explicit snapshot
+// threshold (0 = disabled; see PLAN.md Step S1e).
+func configYAMLWithThreshold(listenAddr, dataDir string, threshold int) string {
 	return `cluster:
   name: distribkv-test
   heartbeat_interval: 50ms
   election_timeout_min: 150ms
   election_timeout_max: 300ms
   data_dir: ` + dataDir + `
-  snapshot_threshold: 0
+  snapshot_threshold: ` + strconv.Itoa(threshold) + `
 nodes:
   - id: 1
     listen_addr: "` + listenAddr + `"
@@ -168,11 +176,11 @@ func TestStart_RestartRecoversRaftAndAcceptsNewWrites(t *testing.T) {
 	// Restart with the SAME data_dir. The FilePersister restores the
 	// raft log and term; the node re-elects and accepts new writes.
 	//
-	// NOTE: the in-memory KV map is NOT persisted in 0.1.0 (snapshotting
-	// is deferred per AGENTS.md). loadPersistedState snaps lastApplied to
-	// commitIndex so committed entries are not replayed — the old value
-	// is therefore gone after restart. This test asserts raft recovery,
-	// not KV value recovery (which is snapshot-territory).
+	// NOTE: snapshot_threshold is 0 here, so no snapshot exists to
+	// rehydrate the KV map — loadPersistedState snaps lastApplied to
+	// commitIndex and committed entries are not replayed (Append is not
+	// idempotent). With threshold > 0, state DOES survive restarts:
+	// see TestStart_RestartRestoresKVStateFromSnapshot.
 	n2 := startSingleNode(t, dataDir)
 	defer n2.Shutdown()
 	eventuallyLeader(t, n2, 5*time.Second)
@@ -185,6 +193,58 @@ func TestStart_RestartRecoversRaftAndAcceptsNewWrites(t *testing.T) {
 	defer ck2.CloseConn()
 	ck2.Put("after", "restart")
 	require.Equal(t, "restart", ck2.Get("after"))
+}
+
+// TestStart_RestartRestoresKVStateFromSnapshot is the gap-closing test
+// (PLAN.md Step S1e): with snapshotting enabled, KV state survives a full
+// process restart. Five Puts against threshold=3 leave a snapshot at
+// index 3 plus a log tail of entries 4..5; recovery rehydrates the map
+// from the snapshot and replays the tail, so the final value reads back.
+func TestStart_RestartRestoresKVStateFromSnapshot(t *testing.T) {
+	dataDir := t.TempDir()
+	dir := t.TempDir()
+	startCfg := filepath.Join(dir, "start.yaml")
+	restartCfg := filepath.Join(dir, "restart.yaml")
+
+	writeFile(t, startCfg, configYAMLWithThreshold("127.0.0.1:0", dataDir, 3))
+	n1, err := server.Start(server.Options{ConfigPath: startCfg, NodeID: 1})
+	require.NoError(t, err)
+	eventuallyLeader(t, n1, 5*time.Second)
+
+	ck := kv.MakeClerk([]string{n1.Addr()}, []int{1}, testLogger(t))
+	const values = 5
+	for i := 1; i <= values; i++ {
+		ck.Put("k", fmt.Sprintf("v%d", i))
+	}
+	require.Equal(t, fmt.Sprintf("v%d", values), ck.Get("k"))
+	ck.CloseConn()
+
+	// The compaction must have happened before shutdown.
+	snapPath := filepath.Join(dataDir, "1", "snapshot.bin")
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(snapPath)
+		return err == nil
+	}, 3*time.Second, 10*time.Millisecond, "snapshot.bin not written under %s", dataDir)
+	n1.Shutdown()
+
+	// Restart on the SAME data dir. Write the restart config against the
+	// already-bound address so both incarnations are interchangeable.
+	writeFile(t, restartCfg, configYAMLWithThreshold(n1.Addr(), dataDir, 3))
+	n2, err := server.Start(server.Options{ConfigPath: restartCfg, NodeID: 1})
+	require.NoError(t, err)
+	defer n2.Shutdown()
+	eventuallyLeader(t, n2, 5*time.Second)
+
+	ck2 := kv.MakeClerk([]string{n2.Addr()}, []int{1}, testLogger(t))
+	defer ck2.CloseConn()
+
+	// THE assertion that failed before snapshotting existed: every value,
+	// including writes past the last snapshot point, is back.
+	assert.Equal(t, fmt.Sprintf("v%d", values), ck2.Get("k"))
+
+	// And the node keeps serving fresh writes afterwards.
+	ck2.Put("post", "snapshot")
+	require.Equal(t, "snapshot", ck2.Get("post"))
 }
 
 // TestStart_HealthServiceRegistered dials the node's gRPC server with a

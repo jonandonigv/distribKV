@@ -20,6 +20,7 @@ package raft
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -104,7 +105,16 @@ type Raft struct {
 	currentTerm int
 	votedFor    int // -1 = no vote this term
 	log         []LogEntry
-	logBase     int // always 0 in 0.1.0; see AGENTS.md "Identity & Persistence"
+	logBase     int // absolute index of log[0]; 0 until the first snapshot
+
+	// Latest snapshot (see PLAN.md Step S1). r.snapshot is opaque KV
+	// bytes covering entries up to r.snapshotIndex in r.snapshotTerm.
+	// Populated by Snapshot() and by loadPersistedState() on recovery;
+	// sent to InstallSnapshot followers in S2. zero/empty when no
+	// snapshot has been taken.
+	snapshot      []byte
+	snapshotIndex int
+	snapshotTerm  int
 
 	// Volatile state.
 	state       State
@@ -233,11 +243,22 @@ func (c Config) validate() error {
 	return nil
 }
 
-// loadPersistedState restores currentTerm, votedFor, and log from the
-// persister. On a non-empty log, commitIndex and lastApplied are snapped
-// to the last entry's index so we don't replay already-applied entries.
-// A fresh-node "does not exist" error is NOT propagated (caller treats
-// any error as "start fresh").
+// loadPersistedState restores durable state before Start (see PLAN.md
+// Step S1c):
+//
+//  1. raft-state: currentTerm, votedFor, log (log entries past logBase).
+//     A load failure here still means "start fresh" per the pre-0.2.0
+//     contract — the caller treats any returned error that way.
+//  2. snapshot.bin: restores logBase/snapshot* and queues one
+//     SnapshotValid ApplyMsg so the KV layer rebuilds its map. Absent
+//     file is normal (fresh/never-compacted node); a CORRUPT snapshot is
+//     degraded to "no snapshot" with a Warn — losing compaction beats
+//     discarding an otherwise-valid raft-state by starting over.
+//  3. Floors: commitIndex >= max(lastLogIndex, snapshotIndex).
+//     lastApplied floors at snapshotIndex (snapshot territory counts as
+//     applied — never re-delivered), while any persisted log TAIL past
+//     the snapshot is left un-applied so Raft's apply loop re-delivers
+//     it onto the restored KV state on the next wake.
 func (r *Raft) loadPersistedState() error {
 	term, votedFor, log, err := r.persister.Load()
 	if err != nil {
@@ -246,10 +267,62 @@ func (r *Raft) loadPersistedState() error {
 	r.currentTerm = term
 	r.votedFor = votedFor
 	r.log = log
-	if len(log) > 0 {
-		r.commitIndex = int(log[len(log)-1].Index)
-		r.lastApplied = r.commitIndex
+
+	snapData, snapIdx, snapTerm, snapErr := r.persister.LoadSnapshot()
+	hasSnapshot := false
+	switch {
+	case snapErr == nil:
+		hasSnapshot = true
+	case errors.Is(snapErr, ErrNoSnapshot):
+		// Fresh / never-compacted node — nothing to do.
+	default:
+		r.logger.Warn("snapshot failed to load; continuing without it",
+			slog.String("err", snapErr.Error()))
 	}
+
+	if hasSnapshot {
+		r.logBase = snapIdx
+		r.snapshotIndex = snapIdx
+		r.snapshotTerm = snapTerm
+		r.snapshot = snapData
+
+		if r.commitIndex < r.snapshotIndex {
+			r.commitIndex = r.snapshotIndex
+		}
+		r.lastApplied = r.snapshotIndex
+
+		msg := ApplyMsg{
+			SnapshotValid:     true,
+			SnapshotData:      append([]byte(nil), snapData...),
+			LastIncludedIndex: snapIdx,
+			LastIncludedTerm:  snapTerm,
+		}
+		select {
+		case r.applyCh <- msg:
+		default:
+			return fmt.Errorf("applyCh full while queueing snapshot rehydration")
+		}
+
+		r.logger.Debug("loaded persisted snapshot",
+			slog.Int("last_included_index", snapIdx),
+			slog.Int("last_included_term", snapTerm))
+	}
+
+	if len(r.log) > 0 {
+		if last := int(r.log[len(r.log)-1].Index); last > r.commitIndex {
+			r.commitIndex = last
+		}
+		if !hasSnapshot {
+			r.lastApplied = r.commitIndex // legacy 0.1.x floor (documented gap)
+		}
+	}
+
+	r.logger.Debug("loaded persisted state",
+		slog.Int("term", r.currentTerm),
+		slog.Int("voted_for", r.votedFor),
+		slog.Int("log_len", len(r.log)),
+		slog.Int("log_base", r.logBase))
+
 	return nil
 }
 

@@ -1,21 +1,33 @@
+// Package raft implements the Raft consensus algorithm. This file holds
+// the Persister abstraction.
+//
 // Persister abstracts durable Raft state so tests can inject in-memory or
 // fault-injecting variants without touching disk. See AGENTS.md "Identity
 // & Persistence".
 //
-// For 0.1.0 the interface is just Save/Load. Snapshot methods will be
-// added when snapshotting is implemented; they will be additive and
-// non-breaking.
+// Two separate lifecycles per PLAN.md:
+//   - raft-state (Save/Load): currentTerm, votedFor, log past logBase.
+//     Mutates on every RPC (persist-before-respond invariant).
+//   - snapshot (SaveSnapshot/LoadSnapshot): the state-machine snapshot +
+//     its {lastIncludedIndex, lastIncludedTerm}. Mutates rarely.
 
 package raft
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
 )
+
+// ErrNoSnapshot is returned by LoadSnapshot when no snapshot has been
+// saved yet (fresh node). Callers treat it as "start from an empty
+// snapshot" — not a fatal error.
+var ErrNoSnapshot = errors.New("snapshot does not exist")
 
 // Persister is the seam between Raft and durable storage.
 type Persister interface {
@@ -28,6 +40,15 @@ type Persister interface {
 	// state exists, implementations return an error the caller can
 	// detect; a fresh node then starts with currentTerm=0, votedFor=-1.
 	Load() (currentTerm int, votedFor int, log []LogEntry, err error)
+
+	// SaveSnapshot durably stores the state-machine snapshot bytes along
+	// with the absolute Raft index and term the snapshot covers. The data
+	// is opaque to the persister (the KV layer owns serialization).
+	SaveSnapshot(data []byte, lastIncludedIndex int, lastIncludedTerm int) error
+
+	// LoadSnapshot restores a previously-saved snapshot. Returns
+	// ErrNoSnapshot when none exists (fresh node).
+	LoadSnapshot() (data []byte, lastIncludedIndex int, lastIncludedTerm int, err error)
 }
 
 // ---------------------------------------------------------------------------
@@ -42,6 +63,11 @@ type MemoryPersister struct {
 	votedFor    int
 	log         []LogEntry
 	saveErr     error
+
+	snapshot      []byte
+	snapshotIndex int
+	snapshotTerm  int
+	hasSnapshot   bool
 }
 
 // NewMemoryPersister returns a ready in-memory persister. Initial state
@@ -102,6 +128,37 @@ func (m *MemoryPersister) Load() (int, int, []LogEntry, error) {
 	return m.currentTerm, m.votedFor, log, nil
 }
 
+// SaveSnapshot stores the snapshot bytes + metadata in memory. Honors
+// SetSaveErr fault injection like Save does (the persist-before-respond
+// invariant applies to snapshots too).
+func (m *MemoryPersister) SaveSnapshot(data []byte, lastIncludedIndex int, lastIncludedTerm int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.saveErr != nil {
+		return m.saveErr
+	}
+	snapshot := make([]byte, len(data))
+	copy(snapshot, data)
+	m.snapshot = snapshot
+	m.snapshotIndex = lastIncludedIndex
+	m.snapshotTerm = lastIncludedTerm
+	m.hasSnapshot = true
+	return nil
+}
+
+// LoadSnapshot returns the in-memory snapshot, or ErrNoSnapshot when none
+// has been saved yet.
+func (m *MemoryPersister) LoadSnapshot() ([]byte, int, int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.hasSnapshot {
+		return nil, 0, 0, ErrNoSnapshot
+	}
+	data := make([]byte, len(m.snapshot))
+	copy(data, m.snapshot)
+	return data, m.snapshotIndex, m.snapshotTerm, nil
+}
+
 // ---------------------------------------------------------------------------
 // FilePersister — JSON-on-disk implementation used in production.
 // ---------------------------------------------------------------------------
@@ -126,14 +183,39 @@ type persistentEntry struct {
 // renamed into place. Concurrent Saves are serialized by a mutex.
 type FilePersister struct {
 	mu       sync.Mutex
-	filename string
+	filename string // raft-state.json (term/votedFor/log)
+
+	// snapshotFile lives beside filename (default: <dir>/snapshot.bin).
+	// Separate file because the two have different lifecycles:
+	// raft-state mutates on every RPC; snapshot mutates rarely. Before
+	// 0.2.0 both wrote to filename, which would have let a snapshot
+	// clobber live raft state.
+	snapshotFile string
 }
 
-// NewFilePersister returns a persister that reads and writes filename.
-// The file is created on the first Save; Load returns a "does not exist"
-// error if the file is absent (fresh node).
+// snapshot.bin on-disk layout: fixed 24-byte header + raw payload.
+//
+//	[0:8]   magic "DSKVSNP1" — detects garbage/truncation
+//	[8:16]  lastIncludedIndex, uint64 little-endian
+//	[16:24] lastIncludedTerm, uint64 little-endian
+//	[24:]   snapshot payload bytes (opaque to the persister)
+//
+// A binary header keeps MB-sized payloads free of base64 inflation and
+// makes corruption detectable without trusting the payload.
+var (
+	snapshotMagic = [8]byte{'D', 'S', 'K', 'V', 'S', 'N', 'P', '1'}
+	snapshotHdrSz = len(snapshotMagic) + 8 + 8
+)
+
+// NewFilePersister returns a persister that reads and writes raft state
+// to filename and snapshots to <dir-of-filename>/snapshot.bin. The files
+// are created on first write; Load/LoadSnapshot return a "does not exist"
+// error when absent (fresh node).
 func NewFilePersister(filename string) *FilePersister {
-	return &FilePersister{filename: filename}
+	return &FilePersister{
+		filename:     filename,
+		snapshotFile: filepath.Join(filepath.Dir(filename), "snapshot.bin"),
+	}
 }
 
 // Save atomically writes currentTerm, votedFor, and log to disk.
@@ -160,7 +242,7 @@ func (p *FilePersister) Save(currentTerm int, votedFor int, log []LogEntry) erro
 	if err != nil {
 		return fmt.Errorf("encode state: %w", err)
 	}
-	return p.atomicWrite(data)
+	return p.atomicWrite(p.filename, data)
 }
 
 // Load reads previously-saved state. Returns an error containing "does not
@@ -194,16 +276,65 @@ func (p *FilePersister) Load() (int, int, []LogEntry, error) {
 	return state.CurrentTerm, state.VotedFor, log, nil
 }
 
-// atomicWrite writes data to <filename>.tmp, fsyncs, then renames into
+// SaveSnapshot atomically writes the snapshot payload + header to
+// <filename> using the same temp+fsync+rename sequence as Save.
+func (p *FilePersister) SaveSnapshot(data []byte, lastIncludedIndex int, lastIncludedTerm int) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if data == nil {
+		data = []byte{}
+	}
+
+	buf := make([]byte, snapshotHdrSz+len(data))
+	copy(buf, snapshotMagic[:])
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(lastIncludedIndex))
+	binary.LittleEndian.PutUint64(buf[16:24], uint64(lastIncludedTerm))
+	copy(buf[snapshotHdrSz:], data)
+
+	return p.atomicWrite(p.snapshotFile, buf)
+}
+
+// LoadSnapshot reads the snapshot file and validates the header. Returns
+// ErrNoSnapshot when the file is absent.
+func (p *FilePersister) LoadSnapshot() ([]byte, int, int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, err := os.Stat(p.snapshotFile); os.IsNotExist(err) {
+		return nil, 0, 0, fmt.Errorf("%w: %s", ErrNoSnapshot, p.snapshotFile)
+	}
+
+	raw, err := os.ReadFile(p.snapshotFile)
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("read snapshot: %w", err)
+	}
+	if len(raw) < snapshotHdrSz {
+		return nil, 0, 0, fmt.Errorf("snapshot too short (%d bytes, need %d)", len(raw), snapshotHdrSz)
+	}
+	var magic [8]byte
+	copy(magic[:], raw[:8])
+	if magic != snapshotMagic {
+		return nil, 0, 0, fmt.Errorf("snapshot header corrupt (bad magic)")
+	}
+
+	idx := int(binary.LittleEndian.Uint64(raw[8:16]))
+	term := int(binary.LittleEndian.Uint64(raw[16:24]))
+	data := make([]byte, len(raw)-snapshotHdrSz)
+	copy(data, raw[snapshotHdrSz:])
+	return data, idx, term, nil
+}
+
+// atomicWrite writes data to <target>.tmp, fsyncs, then renames into
 // place. On failure no .tmp file is left behind and the target file (if
 // any) is untouched.
-func (p *FilePersister) atomicWrite(data []byte) error {
-	tempFile := p.filename + ".tmp"
+func (p *FilePersister) atomicWrite(target string, data []byte) error {
+	tempFile := target + ".tmp"
 
 	// Ensure the parent directory exists. Create-it-once is cheap; if
 	// the parent path is actually a file, MkdirAll returns an error and
 	// we bail out before writing anything to .tmp.
-	if err := os.MkdirAll(filepath.Dir(p.filename), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
 		return fmt.Errorf("create parent dir: %w", err)
 	}
 
@@ -226,7 +357,7 @@ func (p *FilePersister) atomicWrite(data []byte) error {
 		return fmt.Errorf("close temp file: %w", err)
 	}
 
-	if err := os.Rename(tempFile, p.filename); err != nil {
+	if err := os.Rename(tempFile, target); err != nil {
 		_ = os.Remove(tempFile)
 		return fmt.Errorf("rename temp file: %w", err)
 	}
