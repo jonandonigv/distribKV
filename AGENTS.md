@@ -156,7 +156,7 @@ type Raft struct {
 - Do **not** send verification RPCs with `Term: 0` during connect (confuses peers — see `archive/test-harness-v1` TODO #27). Peer dialing is lazy: dial on first RPC failure via `ensureConnected`, not eagerly at construction.
 - Keepalive values (hardcoded in `server/`): EnforcementPolicy `{MinTime: 5s, PermitWithoutStream: true}`; ServerParameters `{Time: 10s, Timeout: 3s}`; ClientParameters mirror.
 - `Raft` owns peer connections; `Shutdown()` closes them all. No separate connection pool.
-- The `InstallSnapshot` RPC is declared in `raft.proto` from day one (for schema stability). The handler returns `codes.Unimplemented` until snapshotting is actually implemented.
+- The `InstallSnapshot` RPC is declared in `raft.proto` and implemented as of 0.2.0: leader fallback in `sendAppendEntries` + full follower handler (see "Snapshotting" below).
 
 ## Raft Implementation Notes
 
@@ -186,36 +186,34 @@ type Raft struct {
 - **Node identity is opaque.** IDs come from `cluster.yaml` (linear list under `nodes:`); binary matches itself via `-id` flag. **Never derive IDs from addresses/ports.** `deriveIdFromAddress` does not come back.
 - `Persister` is an interface (`Save`/`Load` only for 0.1.0; snapshot methods added later as additive, non-breaking changes). Production impl is JSON-on-disk via atomic temp-file + `f.Sync()` + `os.Rename`. Tests may inject fault-injecting variants.
 - **Always use `t.TempDir()` in tests** — never write to `./data` from a test.
-- Log is a 0-indexed slice with a `logBase int` field declared now (always `0` in 0.1.0). All log access uses `log[absIndex - r.logBase - 1]`. `commitIndex`, `lastApplied`, `nextIndex`, `matchIndex` are absolute Raft indices. When snapshotting lands, only `Snapshot()` mutates `logBase`; every existing read site is already correct.
-- `ApplyMsg` already carries both command and (zero-valued) snapshot fields; the type must not change when snapshotting lands later.
+- Log is a 0-indexed slice with a `logBase int` field. All log access uses `log[absIndex - r.logBase - 1]`. `commitIndex`, `lastApplied`, `nextIndex`, `matchIndex` are absolute Raft indices. Only `Snapshot()`/`InstallSnapshot` mutate `logBase`; every read site uses the arithmetic uniformly.
+- `ApplyMsg` carries both command and snapshot fields; snapshot delivery (`SnapshotValid`) is the only path that resets applied state wholesale.
+- **Recovery tail replay**: on restart, `lastApplied = max(logBase, snapshotIndex)` while `commitIndex` snaps to the log tail — Raft's apply loop then re-delivers exactly the persisted tail onto the snapshot-restored state (once each; snapshot territory is never re-applied).
 
-### Snapshotting (deferred — seams baked in for forward compatibility)
+### Snapshotting (shipped in 0.2.0)
 
-Snapshotting is **not implemented in 0.1.0**. The following seams are baked in so the eventual snapshotting work is additive (no refactors, no breaking changes):
+Snapshotting landed in 0.2.0 as planned in `PLAN.md` (S1: local compaction + restart recovery; S2: `InstallSnapshot` RPC). The 0.1.x seams (`ApplyMsg` snapshot fields, `logBase` arithmetic, the declared RPC, the config knob) made it fully additive — no refactors.
 
-- **`ApplyMsg` carries snapshot fields** (`SnapshotValid`, `SnapshotData`, `LastIncludedIndex`, `LastIncludedTerm`), zero-valued and unused in 0.1.0. The type must not change when snapshotting lands.
-- **`logBase int` field on `Raft`** is declared now (always `0` in 0.1.0). All log access uses `log[absIndex - r.logBase - 1]`. When snapshotting lands, only `Snapshot()` mutates `logBase`; every existing read site is already correct.
-- **`InstallSnapshot` RPC is declared in `raft.proto`** from day one. The handler returns `codes.Unimplemented` until the snapshot phase.
-- **`cluster.snapshot_threshold` config field** (int, default `0` = disabled) is parsed but unused in 0.1.0.
+The shipped design:
+- **Trigger**: KV's apply loop fires when `lastApplied - lastSnapshotIndex >= snapshot_threshold` (applied-entry count, not `len(state)` — entry count tracks actual log growth for overwrite-heavy workloads). KV serializes `{state, non-expired dedup}` and calls `rf.Snapshot(lastApplied, data)`. Raft verifies the index is committed + present, truncates the log, bumps `logBase`, persists both files. Threshold ≤ 0 disables.
+- **Dedup rides in the snapshot** — closes the old restart-replay gap; `(0,0)` sentinel entries excluded. `Result.Err` round-trips via strings with `ErrKeyNotFound` restored as a sentinel.
+- **`Raft.Snapshot(index, data)`**: rejects uncommitted territory (`index > commitIndex`) and stale requests (`index <= logBase`, documented no-op). 4MB cap (`maxSnapshotBytes`).
+- **InstallSnapshot RPC** (leader → lagging follower): `sendAppendEntries` checks `prevLogIdx := nextIndex - 1 < logBase`; if so spawns `sendInstallSnapshot` instead. Single-chunk unary RPC (`Done=true`), 5s timeout; on success `matchIndex = snapshotIndex`, `nextIndex = snapshotIndex + 1`.
+- **Follower rules** (the old `CondInstallSnapshot` logic): stale term → ignore; higher term → stepDown then treat as contact; `last_included_index <= commitIndex` → discard; local log term mismatch at that index → divergence guard, discard; shorter-than-snapshot logs accept (only catch-up path); otherwise install — fold `logBase`, keep tail past the snapshot, floor `commitIndex/lastApplied`, persist both files before responding, queue one `SnapshotValid ApplyMsg`.
+- **Persistence**: two files per node, separate lifecycles — `<dir>/raft-state.json` (term/votedFor/log past logBase; mutates every RPC) and `<dir>/snapshot.bin` (24-byte binary header: magic `"DSKVSNP1"` + LE index/term, then opaque payload). FilePersister derives `snapshot.bin` beside the state file.
+- **Recovery**: load raft-state → restore term/votedFor/log; load snapshot → restore `logBase`/snapshot fields and queue a `SnapshotValid ApplyMsg` so KV rehydrates during `kv.NewServer`; floor `commitIndex >= max(logTail, snapshotIndex)`, `lastApplied = snapshotIndex` so any persisted tail replays exactly once onto the restored map. A *corrupt* snapshot degrades to legacy no-snapshot behavior rather than discarding valid raft-state.
 
-The eventual snapshotting design:
-- **Trigger**: KV server's `applyLoop` watches log size; when `len(state) > snapshot_threshold` (or applied entries past threshold exceed threshold), KV serializes its `map[string]string` and calls `rf.Snapshot(lastApplied, snapshotBytes)`. Raft truncates log up to `index`, persists the snapshot, bumps `logBase`. Raft never reads the state machine.
-- **InstallSnapshot RPC** (leader → lagging follower): leader's `sendAppendEntries` checks `nextIndex[peer] - 1 < logBase`; if so, sends `InstallSnapshot` instead of `AppendEntries`. Single unary RPC, snapshot capped at ~4MB.
-- **`CondInstallSnapshot`** (follower): only installs if `last_included_index > commitIndex` AND the snapshot's `last_included_term` matches the local log at that index (we have it). Otherwise discards (we've already applied past this point).
-- **Persistence**: two files per node — `raft-state.json` (currentTerm, votedFor, log past logBase) and `snapshot.bin` (snapshot bytes + `{last_included_index, last_included_term}` header). Separate lifecycles: raft-state mutates every RPC; snapshot mutates rarely.
-- **Recovery**: (1) load snapshot → restore `logBase`, send through `applyCh` so KV rehydrates state. (2) load raft-state → restore term/votedFor/log. (3) set `commitIndex = lastApplied = last_included_index` (no replay of snapshot-territory entries). (4) applyLoop applies subsequent entries normally as they commit.
-
-Knob added to `cluster.yaml`:
+Knob in `cluster.yaml`:
 ```yaml
 cluster:
-  snapshot_threshold: 0    # entries; 0 = never snapshot
+  snapshot_threshold: 0    # entries since last snapshot; 0 = never snapshot
 ```
 
 ## KV Service Notes
 
 - Op types: Get/Put/Append only for 0.1.0. Enum can extend later (additive).
 - **Reads** go through the Raft log (provably linearizable, simple). ReadIndex is a later optimization.
-- **Dedup**: `map[clientId]map[seqNum]*DuplicateEntry`, cap 100/client, TTL 10s. Known gap: dedup cache is *not* persisted, so a leader restart could re-execute a client retry. Fix is snapshot-territory. Document, don't patch around it.
+- **Dedup**: `map[clientId]map[seqNum]*DuplicateEntry`, cap 100/client, TTL 10s. Since 0.2.0 the dedup cache rides in snapshots (non-expired entries only; `(0,0)` sentinels excluded), so restarts no longer re-execute client retries whose entries were compacted. Gap that remains: a restart *without* any snapshot still loses dedup state (same territory as the old KV-map-loss gap — snapshot_threshold > 0 closes it).
 - **`clientId`**: 8-byte `crypto/rand` int64. Never `time.Now().UnixNano()` (collision risk — see 0.0.x TODO #32).
 - **Wrong-leader response**: `{wrong_leader bool, leader_id int32}`. Set `leaderId` only when this node is a **follower** (closes 0.0.x TODO #7 — was set unconditionally).
 - **Pending ops**: `map[index]chan Result`, cap 1000, 5s timeout. Duplicates short-circuit to dedup cache without re-submitting.
