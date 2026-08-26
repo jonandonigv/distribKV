@@ -164,3 +164,124 @@ func TestFilePersister_FailedSaveLeavesNoTarget(t *testing.T) {
 		assert.Error(t, statErr, "no leftover file at %s", leftover)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot persistence (0.2.0 — see PLAN.md "Step S1").
+// ---------------------------------------------------------------------------
+
+var sampleSnapshot = []byte{0x00, 0x01, 0xff, 0xfe, 'k', 'v'} // arbitrary bytes incl. binary
+
+// runSnapshotRoundTrip exercises SaveSnapshot/LoadSnapshot and asserts the
+// loaded metadata + bytes match what was saved. Used by both persister
+// implementations.
+func runSnapshotRoundTrip(t *testing.T, p raft.Persister) {
+	t.Helper()
+	require.NoError(t, p.SaveSnapshot(sampleSnapshot, 42, 7))
+
+	data, idx, term, err := p.LoadSnapshot()
+	require.NoError(t, err)
+	assert.Equal(t, 42, idx)
+	assert.Equal(t, 7, term)
+	assert.Equal(t, sampleSnapshot, data)
+}
+
+func TestMemoryPersister_SnapshotRoundTrip(t *testing.T) {
+	runSnapshotRoundTrip(t, raft.NewMemoryPersister())
+}
+
+// TestMemoryPersister_SnapshotOverwrite verifies a second SaveSnapshot
+// replaces the first.
+func TestMemoryPersister_SnapshotOverwrite(t *testing.T) {
+	p := raft.NewMemoryPersister()
+	require.NoError(t, p.SaveSnapshot([]byte("old"), 10, 1))
+	require.NoError(t, p.SaveSnapshot([]byte("new"), 20, 2))
+
+	data, idx, term, err := p.LoadSnapshot()
+	require.NoError(t, err)
+	assert.Equal(t, []byte("new"), data)
+	assert.Equal(t, 20, idx)
+	assert.Equal(t, 2, term)
+}
+
+func TestMemoryPersister_LoadSnapshotMissing(t *testing.T) {
+	p := raft.NewMemoryPersister()
+	_, _, _, err := p.LoadSnapshot()
+	require.Error(t, err, "LoadSnapshot on a fresh persister should error")
+}
+
+// TestMemoryPersister_StateAndSnapshotIndependent verifies Save (raft-state)
+// and SaveSnapshot don't clobber each other — separate lifecycles per PLAN.md.
+func TestMemoryPersister_StateAndSnapshotIndependent(t *testing.T) {
+	p := raft.NewMemoryPersister()
+	require.NoError(t, p.Save(5, 2, sampleLog()))
+	require.NoError(t, p.SaveSnapshot(sampleSnapshot, 42, 7))
+
+	term, votedFor, loaded, err := p.Load()
+	require.NoError(t, err)
+	assert.Equal(t, 5, term)
+	assert.Equal(t, 2, votedFor)
+	assert.Len(t, loaded, 2)
+
+	_, idx, _, err := p.LoadSnapshot()
+	require.NoError(t, err)
+	assert.Equal(t, 42, idx)
+}
+
+func TestFilePersister_SnapshotRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.bin")
+	p := raft.NewFilePersister(path)
+	runSnapshotRoundTrip(t, p)
+}
+
+// TestFilePersister_SnapshotMissingFile mirrors the Load missing-file case:
+// a fresh node has no snapshot yet and LoadSnapshot must say so cleanly.
+func TestFilePersister_SnapshotMissingFile(t *testing.T) {
+	dir := t.TempDir()
+	p := raft.NewFilePersister(filepath.Join(dir, "nope.bin"))
+	_, _, _, err := p.LoadSnapshot()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not exist")
+}
+
+// TestFilePersister_SnapshotCreatesParentDirs verifies snapshot writes into
+// a not-yet-existing data dir succeed (matches Save's MkdirAll behavior).
+func TestFilePersister_SnapshotCreatesParentDirs(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nested", "deeper", "snapshot.bin")
+	p := raft.NewFilePersister(path)
+
+	require.NoError(t, p.SaveSnapshot(sampleSnapshot, 9, 3))
+
+	data, idx, term, err := p.LoadSnapshot()
+	require.NoError(t, err)
+	assert.Equal(t, sampleSnapshot, data)
+	assert.Equal(t, 9, idx)
+	assert.Equal(t, 3, term)
+}
+
+// TestFilePersister_SnapshotNoTempLeftover verifies the atomic-write
+// invariant holds for snapshots too.
+func TestFilePersister_SnapshotNoTempLeftover(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.bin")
+	p := raft.NewFilePersister(path)
+
+	require.NoError(t, p.SaveSnapshot(sampleSnapshot, 1, 1))
+
+	_, tmpStatErr := os.Stat(path + ".tmp")
+	assert.True(t, os.IsNotExist(tmpStatErr),
+		"no .tmp file should remain after a successful SaveSnapshot, got err=%v", tmpStatErr)
+}
+
+// TestFilePersister_CorruptSnapshotHeader verifies a truncated/garbage
+// snapshot file surfaces a decode error rather than garbage state.
+func TestFilePersister_CorruptSnapshotHeader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snapshot.bin")
+	require.NoError(t, os.WriteFile(path, []byte("garbage-not-a-header"), 0644))
+
+	p := raft.NewFilePersister(path)
+	_, _, _, err := p.LoadSnapshot()
+	require.Error(t, err)
+}

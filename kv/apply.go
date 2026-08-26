@@ -26,22 +26,29 @@ func (s *Server) applyLoop() {
 			// applyCh closed by Kill's drain goroutine — exit cleanly.
 			return
 		}
-		if !msg.CommandValid {
-			// Snapshot messages are unimplemented in 0.1.0; ignore.
-			continue
-		}
 		s.processApplyMsg(msg)
 	}
 }
 
-// processApplyMsg deserializes the Command from an ApplyMsg, applies it
-// to the state map, and notifies the waiting RPC handler. Handles:
-//   - Deserialize failure: notify waiter with error, don't apply (closes
-//     0.0.x TODO #28: panic on deserialization corrupts server).
-//   - Duplicate detection: if (clientId, seqNum) already applied, return
-//     cached result without re-executing.
+// processApplyMsg is the single dispatcher for messages from raft's
+// applyCh. Two message kinds:
+//   - SnapshotValid: rehydrate {state, dedup} wholesale (kv/snapshot.go).
+//   - CommandValid: deserialize the Command, apply it to the state map,
+//     notify the waiting RPC handler. Handles:
+//   - Deserialize failure: notify waiter with error, don't apply
+//     (closes 0.0.x TODO #28).
+//   - Duplicate detection: (clientId, seqNum) already applied → cached
+//     result without re-executing.
 //   - Normal apply: Put overwrites, Append concatenates, Get reads.
 func (s *Server) processApplyMsg(msg raft.ApplyMsg) {
+	if msg.SnapshotValid {
+		s.handleSnapshotMsg(msg)
+		return
+	}
+	if !msg.CommandValid {
+		return
+	}
+
 	op, err := deserializeCommand(msg.Command)
 	if err != nil {
 		s.logger.Error("deserialize failed",
@@ -65,6 +72,7 @@ func (s *Server) processApplyMsg(msg raft.ApplyMsg) {
 
 	// Apply the command to the state machine.
 	result := s.applyCommandLocked(op)
+	s.lastApplied = msg.CommandIndex
 
 	// Cache the result for duplicate detection.
 	s.saveDuplicateLocked(op.ClientId, op.SequenceId, result)
@@ -76,6 +84,10 @@ func (s *Server) processApplyMsg(msg raft.ApplyMsg) {
 
 	// Notify the waiting RPC handler.
 	s.notifyWaiter(msg.CommandIndex, result)
+
+	// Log-compaction trigger (PLAN.md S1d): fold applied territory into
+	// raft when enough entries accumulated since the last snapshot.
+	s.takeSnapshot()
 }
 
 // applyCommandLocked executes an Op on the KV state map. Caller must
