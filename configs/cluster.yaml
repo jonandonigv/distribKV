@@ -12,7 +12,7 @@ cluster:
   election_timeout_min: 150ms
   election_timeout_max: 300ms
   data_dir: ./data
-  snapshot_threshold: 0    # entries; 0 = never snapshot (deferred)
+  snapshot_threshold: 0    # applied entries since last snapshot; 0 = never
 
 nodes:
   - id: 1

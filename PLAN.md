@@ -1,12 +1,14 @@
-# Snapshotting plan (0.2.0)
+# Snapshotting plan (0.2.0) — SHIPPED
 
-Log compaction (snapshotting) for distribKV. The 0.1.x seams are already
-baked in (verified in the codebase): `ApplyMsg` carries snapshot fields
-(`raft/types.go:51-54`), `logBase` arithmetic is used in every log access
-(`sendAppendEntries`, `applyPendingEntries`), `InstallSnapshot` RPC is
-declared with an `Unimplemented` handler (`raft/replication.go:410`),
-`snapshot_threshold` config knob is parsed, and the KV applyLoop
-`continue`s on `!CommandValid` (`kv/apply.go:29`).
+> **Status: complete.** S1 merged via PR #23, S2 via PR #25 (0.2.0 → dev → main).
+> The authoritative design notes now live in AGENTS.md "Snapshotting
+> (shipped in 0.2.0)". This file is retained as the implementation record.
+
+Log compaction (snapshotting) for distribKV. The 0.1.x seams were already
+baked in (verified in the codebase): `ApplyMsg` carries snapshot fields,
+`logBase` arithmetic is used in every log access, `InstallSnapshot` RPC was
+declared with an `Unimplemented` handler, and the `snapshot_threshold`
+config knob was parsed but unused.
 
 **Branch:** `0.2.0` off `main`.
 **Trigger:** applied-entry count (`lastApplied - lastSnapshotIndex >= threshold`).

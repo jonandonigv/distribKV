@@ -33,7 +33,7 @@ It is built as a learning-focused portfolio piece following the [MIT 6.824 Distr
 
 **2. Key-value service layer** (`kv/`)
 
-- `Get`/`Put`/`Append` operations through Raft (every read goes through the log — provably linearizable)
+- `Get`/`Put`/`Append` operations through Raft (every read goes through the log provably linearizable)
 - Duplicate detection (`clientId`/`seqNum` cache, cap 100/client, 10s TTL)
 - Wrong-leader hints (`{wrong_leader, leader_id}`) so clients fail over fast
 - Pending-op tracking with 5s timeout and `ErrTooManyPending` backpressure
@@ -41,11 +41,15 @@ It is built as a learning-focused portfolio piece following the [MIT 6.824 Distr
 
 ### Configuration-driven identity
 
-Node IDs are opaque integers from `cluster.yaml` — never derived from ports. Each node matches itself by `-id` and learns its peers from the same file. No `deriveIdFromAddress`, no port-coupling, no surprises on ephemeral test ports.
+Node IDs are opaque integers from `cluster.yaml` never derived from ports. Each node matches itself by `-id` and learns its peers from the same file. No `deriveIdFromAddress`, no port-coupling, no surprises on ephemeral test ports.
 
-### Forward-compatible with snapshotting
+### Snapshotting (log compaction)
 
-Log compaction (snapshotting) isn't implemented yet, but the seams are baked in so the eventual work is additive: `ApplyMsg` already carries snapshot fields (zero-valued), `logBase` is declared and used in every log access, `raft.proto` declares `InstallSnapshot` (handler returns `codes.Unimplemented`), and `cluster.yaml` carries a `snapshot_threshold` knob (default `0` = disabled).
+Snapshotting shipped in 0.2.0. When `snapshot_threshold` applied entries accumulate since the last compaction, the KV layer serializes `{state, dedup cache}` and Raft folds the log up to that point (`logBase` advances, persisted as a separate `snapshot.bin` with a corruption-detectable binary header). KV state now survives full process restarts — the apply loop rehydrates from the snapshot, then replays exactly the persisted log tail once on top.
+
+Lagging followers are caught up by the `InstallSnapshot` RPC (Raft paper section 7): when a peer's `nextIndex` falls behind the leader's compacted base, the leader ships the snapshot directly instead of AppendEntries that describe truncated territory; the follower validates it (stale-term / already-applied / divergence guards), installs atomically, and ordinary replication resumes past the snapshot point. Snapshots are capped at 4MB; single-chunk transfer.
+
+Set `cluster.snapshot_threshold` in `cluster.yaml` (default `0` = never snapshot, preserving pre-0.2.0 behavior).
 
 ## Project structure
 
@@ -92,7 +96,7 @@ make cluster-down       # docker compose down
 make cluster-logs       # docker compose logs -f
 ```
 
-Tests use `github.com/stretchr/testify` (`require` for fatal assertions, `assert` for non-fatal, `require.Eventually`/`Never` for async conditions — no `time.Sleep`). The race detector is mandatory.
+Tests use `github.com/stretchr/testify` (`require` for fatal assertions, `assert` for non-fatal, `require.Eventually`/`Never` for async conditions no `time.Sleep`). The race detector is mandatory.
 
 ## Cluster configuration
 
@@ -103,7 +107,7 @@ cluster:
   election_timeout_min: 150ms
   election_timeout_max: 300ms
   data_dir: ./data             # local dev (gitignored); docker uses /var/lib/distribkv
-  snapshot_threshold: 0    # entries; 0 = never snapshot (deferred)
+  snapshot_threshold: 0    # applied entries since last snapshot; 0 = never
 
 nodes:
   - id: 1
@@ -125,3 +129,4 @@ Run a node with: `bin/kvserver -config configs/cluster.yaml -id 1 -log.level inf
 ---
 
 _Built as a learning project following MIT 6.824, architected with production patterns in mind._
+
