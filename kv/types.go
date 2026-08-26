@@ -133,6 +133,13 @@ type Server struct {
 	dead       bool
 	shutdownCh chan struct{}
 
+	// Snapshot bookkeeping (PLAN.md Step S1d). lastApplied tracks every
+	// applied index (commands AND snapshot rehydration); lastSnapshotIndex
+	// is what we last folded into rf.Snapshot. The trigger fires when
+	// lastApplied - lastSnapshotIndex >= rf.SnapshotThreshold().
+	lastApplied       int
+	lastSnapshotIndex int
+
 	logger *slog.Logger
 }
 
