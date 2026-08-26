@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jonandonigv/distribKV/raft/raftpb"
@@ -175,6 +176,17 @@ func (r *Raft) sendAppendEntries(peerId int, term int, commitIdx int) {
 		nextIdx = 1
 	}
 	prevLogIdx := nextIdx - 1
+
+	// Peer is behind the snapshot point: AppendEntries cannot describe
+	// that territory (prevLogTerm would read a truncated index). Ship the
+	// snapshot instead (PLAN.md S2). Unlock first — never spawn while
+	// holding r.mu.
+	if prevLogIdx < r.logBase {
+		r.mu.Unlock()
+		go r.sendInstallSnapshot(peerId, term)
+		return
+	}
+
 	prevLogTerm := int64(0)
 	if prevLogIdx > 0 {
 		arrayIdx := prevLogIdx - r.logBase - 1
@@ -402,11 +414,105 @@ func (r *Raft) ReplicateCommand(cmd []byte) (int, error) {
 }
 
 // ---------------------------------------------------------------------------
-// InstallSnapshot (deferred — seam baked in per AGENTS.md).
+// InstallSnapshot (leader → lagging follower, PLAN.md Step S2).
 // ---------------------------------------------------------------------------
 
-// InstallSnapshot is declared in raft.proto for schema stability but is
-// not implemented in 0.1.0. Returns codes.Unimplemented.
+// InstallSnapshot receives the leader's snapshot when this follower is
+// too far behind for AppendEntries to bridge (its nextIndex predates our
+// logBase). Implements the section-7 rules with the CondInstallSnapshot
+// guard from AGENTS.md:
+//
+//   - stale term            → respond currentTerm, ignore.
+//   - higher term           → stepDown, then treat as valid contact.
+//   - lastIncludedIndex <= commitIndex → already applied past it; discard.
+//   - local log contradicts the snapshot's term at that index → divergent
+//     histories (impossible under Raft safety); discard defensively.
+//   - otherwise install: fold logBase up to the snapshot point, keep any
+//     tail past it, floor commitIndex/lastApplied at the snapshot, persist
+//     BOTH files before responding (persist-before-respond), and queue a
+//     SnapshotValid ApplyMsg so the state machine rehydrates.
 func (r *Raft) InstallSnapshot(ctx context.Context, req *raftpb.InstallSnapshotRequest) (*raftpb.InstallSnapshotResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "snapshotting not implemented in 0.1.0")
+	if len(req.Data) > maxSnapshotBytes {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"snapshot %d bytes exceeds cap %d", len(req.Data), maxSnapshotBytes)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	resp := &raftpb.InstallSnapshotResponse{Term: int64(r.currentTerm)}
+
+	// Rule: stale leader — worthless contact, no timer reset.
+	if req.Term < int64(r.currentTerm) {
+		return resp, nil
+	}
+
+	// Rule: newer term — adopt it first.
+	if req.Term > int64(r.currentTerm) {
+		r.stepDown(int(req.Term))
+		resp.Term = req.Term
+	}
+	r.resetElectionTimerLocked()
+	r.leaderId = int(req.LeaderId)
+
+	lastIdx := int(req.LastIncludedIndex)
+
+	// Guard: we've already applied past this snapshot — nothing to do.
+	if lastIdx <= r.commitIndex {
+		return resp, nil
+	}
+
+	// Guard: divergence check. Only possible if our log actually covers
+	// that index; a shorter log can never contradict the snapshot.
+	arrayIdx := lastIdx - r.logBase - 1
+	if arrayIdx >= 0 && arrayIdx < len(r.log) &&
+		int(r.log[arrayIdx].Index) == lastIdx &&
+		int(r.log[arrayIdx].Term) != int(req.LastIncludedTerm) {
+		r.logger.Warn("InstallSnapshot discarded: term mismatch at snapshot index",
+			slog.Int("index", lastIdx),
+			slog.Int("local_term", int(r.log[arrayIdx].Term)),
+			slog.Int("snapshot_term", int(req.LastIncludedTerm)))
+		return resp, nil
+	}
+
+	// Install. Keep the tail strictly after the snapshot point.
+	tail := make([]LogEntry, 0)
+	for _, e := range r.log {
+		if e.Index > int64(lastIdx) {
+			tail = append(tail, e)
+		}
+	}
+	r.log = tail
+	r.logBase = lastIdx
+	r.snapshot = append([]byte(nil), req.Data...)
+	r.snapshotIndex = lastIdx
+	r.snapshotTerm = int(req.LastIncludedTerm)
+	if r.commitIndex < lastIdx {
+		r.commitIndex = lastIdx
+	}
+	r.lastApplied = lastIdx
+
+	if err := r.persist(); err != nil {
+		return nil, fmt.Errorf("persist raft state after InstallSnapshot: %w", err)
+	}
+	if err := r.persister.SaveSnapshot(r.snapshot, r.snapshotIndex, r.snapshotTerm); err != nil {
+		return nil, fmt.Errorf("save snapshot after InstallSnapshot: %w", err)
+	}
+
+	select {
+	case r.applyCh <- ApplyMsg{
+		SnapshotValid:     true,
+		SnapshotData:      append([]byte(nil), req.Data...),
+		LastIncludedIndex: lastIdx,
+		LastIncludedTerm:  int(req.LastIncludedTerm),
+	}:
+	default:
+		return nil, fmt.Errorf("applyCh full while queueing InstallSnapshot rehydration")
+	}
+
+	r.logger.Info("installed snapshot from leader",
+		slog.Int("index", lastIdx),
+		slog.Int("term", r.snapshotTerm),
+		slog.Int("remaining_log", len(r.log)))
+	return resp, nil
 }
